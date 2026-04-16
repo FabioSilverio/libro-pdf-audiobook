@@ -27,11 +27,15 @@ def extract_text(pdf_path: str) -> str:
     try:
         text_parts = []
 
-        with pdfplumber.open(pdf_path) as pdf:
-            # Check if PDF is encrypted
-            if pdf.is_encrypted:
+        try:
+            pdf_ctx = pdfplumber.open(pdf_path)
+        except Exception as e:
+            msg = str(e).lower()
+            if "encrypt" in msg or "password" in msg:
                 raise EncryptedPDFError()
+            raise
 
+        with pdf_ctx as pdf:
             # Extract text from each page
             for page_num, page in enumerate(pdf.pages, 1):
                 try:
