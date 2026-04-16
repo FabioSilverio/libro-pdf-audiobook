@@ -49,3 +49,4 @@ htmlcov/
 
 # Vite
 frontend/dist/
+.vercel
