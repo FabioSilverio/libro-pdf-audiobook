@@ -1,15 +1,26 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import UploadForm from './components/UploadForm';
 import ProgressTracker from './components/ProgressTracker';
 import ChaptersView from './components/ChaptersView';
+import Library from './components/Library';
 import { getAudiobookMetadata } from './services/api';
+import { getBook, getLibrary, upsertBook } from './services/library';
 import './App.css';
 
+// Views: upload | processing | audiobook | library
 export default function App() {
-  const [view, setView] = useState('upload'); // upload | processing | audiobook
+  const [view, setView] = useState(() =>
+    getLibrary().length > 0 ? 'library' : 'upload'
+  );
   const [taskId, setTaskId] = useState(null);
   const [audiobook, setAudiobook] = useState(null);
   const [error, setError] = useState(null);
+  const [libraryCount, setLibraryCount] = useState(getLibrary().length);
+
+  // Keep library count in sync
+  useEffect(() => {
+    setLibraryCount(getLibrary().length);
+  }, [view, audiobook]);
 
   const handleUploadSuccess = (result) => {
     setTaskId(result.task_id);
@@ -20,9 +31,10 @@ export default function App() {
   const handleProcessingComplete = async () => {
     try {
       const data = await getAudiobookMetadata(taskId);
+      upsertBook(data);
       setAudiobook(data);
       setView('audiobook');
-    } catch (err) {
+    } catch {
       setError('Failed to load audiobook data');
     }
   };
@@ -34,15 +46,54 @@ export default function App() {
     setError(null);
   };
 
+  const openBook = async (id) => {
+    // Try cache first for instant load, then refresh from server
+    const cached = getBook(id);
+    if (cached) {
+      setAudiobook(cached);
+      setTaskId(id);
+      setView('audiobook');
+    }
+    try {
+      const fresh = await getAudiobookMetadata(id);
+      upsertBook(fresh);
+      setAudiobook(fresh);
+      setTaskId(id);
+      if (!cached) setView('audiobook');
+    } catch {
+      if (!cached) setError('Could not load this book from the server. It may have expired.');
+    }
+  };
+
+  const goLibrary = () => {
+    setAudiobook(null);
+    setTaskId(null);
+    setError(null);
+    setView('library');
+  };
+
   return (
     <div className="app">
       <header className="app-header">
         <div className="header-inner">
-          <div className="brand">
+          <button
+            className="brand"
+            onClick={() => setView(libraryCount > 0 ? 'library' : 'upload')}
+            style={{ cursor: 'pointer' }}
+          >
             <span className="brand-mark">L</span>
             <span>Libro</span>
-          </div>
-          <div className="header-nav">PDF → Audiobook, with care.</div>
+          </button>
+          <nav className="header-nav-buttons">
+            {view !== 'library' && libraryCount > 0 && (
+              <button className="nav-link" onClick={goLibrary}>
+                Library <span className="badge">{libraryCount}</span>
+              </button>
+            )}
+            {view !== 'upload' && (
+              <button className="nav-link" onClick={handleStartOver}>+ New</button>
+            )}
+          </nav>
         </div>
       </header>
 
@@ -60,7 +111,8 @@ export default function App() {
               <h1>Turn any book into a <em>listenable</em> story.</h1>
               <p className="tagline">
                 Upload a PDF up to 400&nbsp;MB. We'll extract its chapters,
-                summarise each one, and generate a neural audiobook — all free, no keys.
+                summarise each one, generate a neural audiobook, and remember
+                where you left off.
               </p>
             </section>
 
@@ -75,7 +127,7 @@ export default function App() {
                 <div className="feature-card">
                   <div className="feature-icon">📖</div>
                   <h3>Extract</h3>
-                  <p>pdfplumber pulls clean text from every page, even messy books.</p>
+                  <p>pdfplumber pulls clean text; scanned PDFs fall back to Tesseract OCR.</p>
                 </div>
                 <div className="feature-card">
                   <div className="feature-icon">✨</div>
@@ -101,12 +153,20 @@ export default function App() {
         )}
 
         {view === 'audiobook' && audiobook && (
-          <ChaptersView audiobook={audiobook} onStartOver={handleStartOver} />
+          <ChaptersView
+            audiobook={audiobook}
+            onStartOver={handleStartOver}
+            onBackToLibrary={libraryCount > 0 ? goLibrary : null}
+          />
+        )}
+
+        {view === 'library' && (
+          <Library onOpen={openBook} onNew={handleStartOver} />
         )}
       </main>
 
       <footer className="app-footer">
-        Built with FastAPI · React · edge-tts · sumy — no API keys required.
+        Built with FastAPI · React · edge-tts · sumy — progress saved locally in your browser.
       </footer>
     </div>
   );
