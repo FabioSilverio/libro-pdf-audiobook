@@ -7,15 +7,40 @@ import { getAudiobookMetadata } from './services/api';
 import { getBook, getLibrary, upsertBook } from './services/library';
 import './App.css';
 
+const ACTIVE_TASK_KEY = 'libro.activeTask.v1';
+
 // Views: upload | processing | audiobook | library
 export default function App() {
-  const [view, setView] = useState(() =>
-    getLibrary().length > 0 ? 'library' : 'upload'
-  );
-  const [taskId, setTaskId] = useState(null);
+  // Boot state: check URL ?task=..., then an unfinished task in localStorage.
+  const boot = (() => {
+    try {
+      const urlTask = new URLSearchParams(window.location.search).get('task');
+      if (urlTask) return { view: 'processing', taskId: urlTask };
+      const stored = localStorage.getItem(ACTIVE_TASK_KEY);
+      if (stored) return { view: 'processing', taskId: stored };
+    } catch {}
+    return {
+      view: getLibrary().length > 0 ? 'library' : 'upload',
+      taskId: null,
+    };
+  })();
+
+  const [view, setView] = useState(boot.view);
+  const [taskId, setTaskId] = useState(boot.taskId);
   const [audiobook, setAudiobook] = useState(null);
   const [error, setError] = useState(null);
   const [libraryCount, setLibraryCount] = useState(getLibrary().length);
+
+  // Persist the active taskId so a refresh / closed tab can resume.
+  useEffect(() => {
+    try {
+      if (taskId && view === 'processing') {
+        localStorage.setItem(ACTIVE_TASK_KEY, taskId);
+      } else {
+        localStorage.removeItem(ACTIVE_TASK_KEY);
+      }
+    } catch {}
+  }, [taskId, view]);
 
   // Keep library count in sync
   useEffect(() => {
