@@ -140,6 +140,7 @@ function ChapterCard({
   const audioRef = useRef(null);
   const lastSavedTimeRef = useRef(0);
   const [restored, setRestored] = useState(false);
+  const [showFull, setShowFull] = useState(false);
 
   // Restore playback position once metadata is loaded
   useEffect(() => {
@@ -177,6 +178,9 @@ function ChapterCard({
     ? Math.min(100, Math.round((savedAudio.time / savedAudio.duration) * 100))
     : 0;
 
+  const keyPoints = chapter.key_points || [];
+  const fullText = chapter.full_text || '';
+
   return (
     <article className={`chapter-card ${isRead ? 'is-read' : ''}`}>
       <div className="chapter-header">
@@ -187,7 +191,17 @@ function ChapterCard({
           <span>Read</span>
         </label>
       </div>
-      {chapter.summary && <p className="chapter-summary">{chapter.summary}</p>}
+
+      {keyPoints.length > 0 && (
+        <ul className="chapter-key-points">
+          {keyPoints.map((kp, i) => <li key={i}>{kp}</li>)}
+        </ul>
+      )}
+
+      {chapter.summary && (
+        <p className="chapter-summary">{chapter.summary}</p>
+      )}
+
       {audioUrl ? (
         <div className="chapter-audio">
           <audio
@@ -208,6 +222,25 @@ function ChapterCard({
       ) : (
         <div className="chapter-audio-missing">
           Audio not generated for this chapter.
+        </div>
+      )}
+
+      {fullText && (
+        <div className="chapter-full-wrap">
+          <button
+            className="chapter-expand-btn"
+            onClick={() => setShowFull((v) => !v)}
+            aria-expanded={showFull}
+          >
+            {showFull ? '− Hide full chapter' : '+ Read full chapter'}
+          </button>
+          {showFull && (
+            <div className="chapter-full-text">
+              {fullText.split(/\n{2,}/).map((para, i) => (
+                <p key={i}>{para}</p>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </article>

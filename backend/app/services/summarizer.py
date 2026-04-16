@@ -82,7 +82,8 @@ def _detect_language(text: str) -> str:
 
 
 def _length_to_sentences(length: str) -> int:
-    return {"short": 4, "medium": 8, "long": 14}.get(length, 8)
+    # Sentences in the *per-chapter* / overall summary. Sumy trims to available.
+    return {"short": 4, "medium": 10, "long": 20}.get(length, 10)
 
 
 def summarize_sync(text: str, length: str = "medium", language: str = "auto") -> Dict[str, Any]:
@@ -140,12 +141,13 @@ async def generate_chapter_summaries(
         else:
             res = await summarize(text, length=length, language=language)
             summary = res["summary"]
-            key_points = res.get("key_points", [])[:3]
+            key_points = res.get("key_points", [])[:5]
 
         results.append({
             "chapter_number": i + 1,
             "title": title,
             "summary": summary,
             "key_points": key_points,
+            "full_text": text,  # UI lets the user expand to read the whole chapter
         })
     return results

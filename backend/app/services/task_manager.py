@@ -165,6 +165,19 @@ class TaskManager:
             text = await asyncio.to_thread(extract_text, task["file_path"])
             metadata = await asyncio.to_thread(extract_metadata, task["file_path"])
 
+            # Fall back to the uploaded filename (without the .pdf extension)
+            # when the PDF has no embedded title — otherwise every book
+            # ends up displayed as "Untitled book" in the library.
+            if not metadata.get("title"):
+                original = opts.get("original_filename") or ""
+                if original:
+                    stem = Path(original).stem.strip()
+                    # Replace underscores/hyphens with spaces for readability
+                    stem = stem.replace("_", " ").replace("-", " ").strip()
+                    if stem:
+                        metadata["title"] = stem[:200]
+            metadata["original_filename"] = opts.get("original_filename")
+
             (output_dir / "extracted_text.txt").write_text(text, encoding="utf-8")
 
             language = opts.get("language", "auto")
@@ -199,7 +212,9 @@ class TaskManager:
                     task_id, progress=35, message="Summarizing chapters...",
                 )
                 chapter_summaries = await generate_chapter_summaries(
-                    chapters, length="short", language=language,
+                    chapters,
+                    length=opts.get("summary_length", "medium"),
+                    language=language,
                 )
                 summary_data["chapters"] = chapter_summaries
             else:
