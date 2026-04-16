@@ -162,7 +162,25 @@ class TaskManager:
                 stage="extracting",
                 message="Reading PDF (OCR will run if it's scanned — may take a few minutes)...",
             )
-            text = await asyncio.to_thread(extract_text, task["file_path"])
+            # Progress callback invoked from inside extract_text's worker
+            # thread (especially during slow OCR). Schedule the async
+            # _update_status back onto the main loop.
+            main_loop = asyncio.get_running_loop()
+
+            def _extract_progress(stage: str, done: int, total: int, message: str):
+                # Map 0..total into the 5..20 progress band.
+                pct = 5 + int((done / max(total, 1)) * 15)
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status(task_id, progress=pct, message=message),
+                    main_loop,
+                )
+
+            text = await asyncio.to_thread(
+                extract_text,
+                task["file_path"],
+                ocr_lang=opts.get("language", "auto"),
+                on_progress=_extract_progress,
+            )
             metadata = await asyncio.to_thread(extract_metadata, task["file_path"])
 
             # Fall back to the uploaded filename (without the .pdf extension)

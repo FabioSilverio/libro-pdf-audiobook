@@ -11,17 +11,30 @@ from app.core.exceptions import PDFProcessingError, EncryptedPDFError, EmptyPDFE
 logger = logging.getLogger(__name__)
 
 # OCR configuration
-OCR_LANGS = "por+eng+spa"  # combine common languages
-OCR_DPI = 200
+OCR_DEFAULT_LANG = "por"  # single language is 3-5x faster than multi-lang
+OCR_DPI = 150  # 150 is plenty for text; 200+ doubles runtime with little gain
 OCR_MIN_CHARS_PER_PAGE = 40  # below this, treat as scanned and OCR
 OCR_MAX_PAGES = 2000  # hard cap to avoid running OCR forever
+OCR_PAGE_TIMEOUT = 60  # seconds per page before giving up
+_LANG_MAP = {  # UI language code -> tesseract lang pack
+    "auto": OCR_DEFAULT_LANG,
+    "portuguese": "por",
+    "pt": "por",
+    "english": "eng",
+    "en": "eng",
+    "spanish": "spa",
+    "es": "spa",
+}
 
 
-def extract_text(pdf_path: str) -> str:
+def extract_text(pdf_path: str, *, ocr_lang: str = "auto", on_progress=None) -> str:
     """Extract all text from a PDF file.
 
     Args:
         pdf_path: Path to the PDF file
+        ocr_lang: Preferred language for OCR ("auto"/"portuguese"/"english"/"spanish").
+        on_progress: Optional callable `fn(stage, done, total, message)` used to
+            stream progress updates to the caller (especially during slow OCR).
 
     Returns:
         Extracted text content
@@ -68,7 +81,8 @@ def extract_text(pdf_path: str) -> str:
                     f"Text extraction sparse ({len(cleaned_text)} chars over "
                     f"{page_count} pages). Falling back to OCR."
                 )
-                ocr_text = _ocr_pdf(pdf_path)
+                tess_lang = _LANG_MAP.get(ocr_lang, OCR_DEFAULT_LANG)
+                ocr_text = _ocr_pdf(pdf_path, lang=tess_lang, on_progress=on_progress)
                 ocr_cleaned = clean_text(ocr_text)
                 if ocr_cleaned and len(ocr_cleaned) > len(cleaned_text):
                     cleaned_text = ocr_cleaned
@@ -108,55 +122,108 @@ def _ocr_available() -> bool:
     return True
 
 
-def _ocr_pdf(pdf_path: str) -> str:
+def _ocr_pdf(pdf_path: str, *, lang: str = OCR_DEFAULT_LANG, on_progress=None) -> str:
     """Run Tesseract OCR over every page of the PDF.
 
-    Converts each page to an image via pdf2image (poppler) then extracts text.
-    This is slow — expect seconds per page.
+    Converts each page to an image via pdf2image (poppler) and runs tesseract
+    (single language for speed). Calls `on_progress('ocr', done, total, msg)`
+    after each page so the caller can surface live status to the user.
     """
     import pytesseract
+    from pdfminer.pdfparser import PDFParser
+    from pdfminer.pdfdocument import PDFDocument
     from pdf2image import convert_from_path
+    import time
+
+    # Detect total page count up-front so we can compute percentage.
+    total_pages = 0
+    try:
+        with open(pdf_path, "rb") as fh:
+            parser = PDFParser(fh)
+            doc = PDFDocument(parser)
+            total_pages = int(doc.catalog.get("Pages").resolve().get("Count", 0))  # type: ignore
+    except Exception:
+        pass
+    if total_pages <= 0:
+        # Fallback via pdfplumber (slower but reliable).
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+        except Exception:
+            total_pages = OCR_MAX_PAGES
+
+    logger.info(f"OCR starting: {total_pages} pages, lang={lang}, dpi={OCR_DPI}")
+    if on_progress:
+        try:
+            on_progress("ocr", 0, total_pages, f"OCR starting ({total_pages} pages, {lang})")
+        except Exception:
+            pass
 
     texts: List[str] = []
-    # Process in batches to keep memory bounded.
-    batch = 5
-    page = 1
-    while page <= OCR_MAX_PAGES:
+    batch = 4
+    done = 0
+    t0 = time.time()
+
+    for start in range(1, min(total_pages, OCR_MAX_PAGES) + 1, batch):
+        end = min(start + batch - 1, total_pages)
         try:
             images = convert_from_path(
                 pdf_path,
                 dpi=OCR_DPI,
-                first_page=page,
-                last_page=page + batch - 1,
+                first_page=start,
+                last_page=end,
                 fmt="png",
                 thread_count=2,
             )
         except Exception as e:
-            logger.warning(f"pdf2image failed at page {page}: {e}")
+            logger.warning(f"pdf2image failed at page {start}: {e}")
             break
 
         if not images:
             break
 
-        for i, img in enumerate(images):
+        for offset, img in enumerate(images):
+            page_num = start + offset
             try:
-                text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+                text = pytesseract.image_to_string(
+                    img, lang=lang, timeout=OCR_PAGE_TIMEOUT,
+                )
                 if text:
                     texts.append(text)
+            except RuntimeError as e:
+                # Tesseract raises RuntimeError on timeout.
+                logger.warning(f"OCR timeout on page {page_num}: {e}")
             except Exception as e:
-                logger.warning(f"OCR failed at page {page + i}: {e}")
+                logger.warning(f"OCR failed at page {page_num}: {e}")
             finally:
                 try:
                     img.close()
                 except Exception:
                     pass
 
-        if len(images) < batch:
-            break
-        page += batch
+            done += 1
+            if on_progress and (done % 2 == 0 or done == total_pages):
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = (total_pages - done) / rate if rate > 0 else 0
+                try:
+                    on_progress(
+                        "ocr", done, total_pages,
+                        f"OCR page {done}/{total_pages} "
+                        f"(~{int(remaining)}s remaining)",
+                    )
+                except Exception:
+                    pass
+
+        # Log every batch so Railway logs show progress.
+        logger.info(
+            f"OCR progress: {done}/{total_pages} pages "
+            f"({len(''.join(texts))} chars so far)"
+        )
 
     result = "\n\n".join(texts)
-    logger.info(f"OCR produced {len(result)} characters across {page - 1} pages")
+    logger.info(f"OCR done: {len(result)} chars across {done} pages in {time.time()-t0:.1f}s")
     return result
 
 
