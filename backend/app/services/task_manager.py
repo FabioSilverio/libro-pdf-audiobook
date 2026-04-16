@@ -38,9 +38,90 @@ def _safe_filename(name: str, fallback: str) -> str:
 
 
 class TaskManager:
+    # Keys persisted to disk (skip WebSocket handles, etc.).
+    _PERSIST_KEYS = {
+        "task_id", "status", "progress", "stage", "message", "file_path",
+        "options", "created_at", "updated_at", "result", "error",
+    }
+
     def __init__(self):
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.websocket_connections: Dict[str, Any] = {}
+        self._load_tasks_from_disk()
+
+    # ---------------- persistence ----------------
+    def _task_file(self, task_id: str) -> Path:
+        return Path(settings.OUTPUT_DIR) / task_id / "task.json"
+
+    def _persist_task(self, task_id: str) -> None:
+        """Write a task's state to disk atomically."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        path = self._task_file(task_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {k: task.get(k) for k in self._PERSIST_KEYS}
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"persist failed {task_id}: {e}")
+
+    def _load_tasks_from_disk(self) -> None:
+        """On startup, reload task state from disk.
+
+        Any task that was mid-flight is marked failed with a helpful message —
+        we can't resume mid-generation after a restart.
+        """
+        out_dir = Path(settings.OUTPUT_DIR)
+        if not out_dir.exists():
+            return
+        restored = 0
+        resurrected_failed = 0
+        for sub in out_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            task_file = sub / "task.json"
+            if not task_file.exists():
+                continue
+            try:
+                data = json.loads(task_file.read_text(encoding="utf-8"))
+                task_id = data.get("task_id") or sub.name
+                active = data.get("status") in (
+                    TaskStatus.QUEUED, TaskStatus.EXTRACTING,
+                    TaskStatus.SUMMARIZING, TaskStatus.GENERATING_AUDIO,
+                )
+                if active:
+                    data["status"] = TaskStatus.FAILED
+                    data["progress"] = 0
+                    data["message"] = (
+                        "Processing was interrupted by a server restart. "
+                        "Please upload the PDF again — it was not finished."
+                    )
+                    data["error"] = {
+                        "code": "SERVER_RESTART",
+                        "message": "Server restarted mid-processing.",
+                    }
+                    data["updated_at"] = datetime.utcnow().isoformat()
+                    resurrected_failed += 1
+                self.tasks[task_id] = {
+                    **data,
+                    # Required runtime key — might be absent.
+                    "file_path": data.get("file_path", ""),
+                    "options": data.get("options", {}),
+                }
+                restored += 1
+                # Re-persist so status on disk reflects the change.
+                if active:
+                    self._persist_task(task_id)
+            except Exception as e:
+                logger.warning(f"Could not restore task {sub.name}: {e}")
+        if restored:
+            logger.info(
+                f"Restored {restored} task(s) from disk "
+                f"({resurrected_failed} were marked failed due to restart)."
+            )
 
     def create_task(self, file_path: str, options: Optional[Dict[str, Any]] = None) -> str:
         task_id = str(uuid.uuid4())
@@ -58,6 +139,7 @@ class TaskManager:
             "result": None,
             "error": None,
         }
+        self._persist_task(task_id)
         asyncio.create_task(self._process_task(task_id))
         logger.info(f"Created task {task_id}")
         return task_id
@@ -231,6 +313,7 @@ class TaskManager:
         if message:
             task["message"] = message
         task["updated_at"] = datetime.utcnow().isoformat()
+        self._persist_task(task_id)
         await self._send_websocket_update(task_id)
 
     async def _send_websocket_update(self, task_id: str):
@@ -278,6 +361,7 @@ class TaskManager:
         task["status"] = TaskStatus.CANCELLED
         task["message"] = "Task cancelled by user"
         task["updated_at"] = datetime.utcnow().isoformat()
+        self._persist_task(task_id)
         self._cleanup_task_files(task_id)
         return True
 

@@ -103,6 +103,22 @@ export function useTaskProgress(taskId) {
           stopPolling();
         }
       } catch (err) {
+        // 404 on polling almost always means the server forgot the task
+        // (most commonly a redeploy / container restart wiped in-memory
+        // state). Give up immediately with a clear message — otherwise
+        // the UI would hammer the endpoint forever.
+        const code = err?.response?.status;
+        if (code === 404) {
+          console.warn('Task not found on server (404). Likely server restart.');
+          setStatus('failed');
+          setMessage(
+            'The server lost track of this task (it probably restarted). ' +
+            'Please upload the PDF again to resume.'
+          );
+          setError('Task not found on server.');
+          stopPolling();
+          return;
+        }
         console.error('Polling error:', err);
         setError(err.message || 'Failed to fetch task status');
       }
