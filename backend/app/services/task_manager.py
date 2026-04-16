@@ -1,0 +1,301 @@
+"""Task orchestration: PDF extraction -> summary -> audiobook (per chapter MP3)."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from app.config import settings
+from app.core.exceptions import AppException
+from app.models import TaskStatus
+from app.services.pdf_processor import (
+    extract_text,
+    extract_metadata,
+    split_into_chapters,
+)
+from app.services.summarizer import (
+    summarize,
+    generate_chapter_summaries,
+    _detect_language,
+)
+from app.services.edge_tts_generator import (
+    synthesize_to_file,
+    detect_voice_for_language,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_filename(name: str, fallback: str) -> str:
+    import re
+    clean = re.sub(r"[^A-Za-z0-9_\- ]+", "", name).strip().replace(" ", "_")
+    return clean[:60] or fallback
+
+
+class TaskManager:
+    def __init__(self):
+        self.tasks: Dict[str, Dict[str, Any]] = {}
+        self.websocket_connections: Dict[str, Any] = {}
+
+    def create_task(self, file_path: str, options: Optional[Dict[str, Any]] = None) -> str:
+        task_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        self.tasks[task_id] = {
+            "task_id": task_id,
+            "status": TaskStatus.QUEUED,
+            "progress": 0,
+            "stage": "queued",
+            "message": "Task queued for processing",
+            "file_path": file_path,
+            "options": options or {},
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "error": None,
+        }
+        asyncio.create_task(self._process_task(task_id))
+        logger.info(f"Created task {task_id}")
+        return task_id
+
+    async def _process_task(self, task_id: str):
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+
+        opts = task["options"]
+        output_dir = Path(settings.OUTPUT_DIR) / task_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir = output_dir / "audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # 1. Extract text ---------------------------------------------------
+            await self._update_status(
+                task_id, status=TaskStatus.EXTRACTING, progress=5,
+                stage="extracting", message="Reading PDF and extracting text...",
+            )
+            text = await asyncio.to_thread(extract_text, task["file_path"])
+            metadata = await asyncio.to_thread(extract_metadata, task["file_path"])
+
+            (output_dir / "extracted_text.txt").write_text(text, encoding="utf-8")
+
+            language = opts.get("language", "auto")
+            if language == "auto":
+                language = _detect_language(text)
+
+            await self._update_status(
+                task_id, progress=20,
+                message=f"Extracted {len(text):,} chars from {metadata.get('page_count', '?')} pages ({language})",
+            )
+
+            # 2. Detect chapters ------------------------------------------------
+            chapters = await asyncio.to_thread(split_into_chapters, text)
+            logger.info(f"Task {task_id}: {len(chapters)} chapters detected")
+
+            # 3. Summarization --------------------------------------------------
+            summary_data: Dict[str, Any] = {"metadata": metadata, "language": language}
+            if opts.get("summarize", True):
+                await self._update_status(
+                    task_id, status=TaskStatus.SUMMARIZING, progress=25,
+                    stage="summarizing", message="Summarizing book...",
+                )
+                overall = await summarize(
+                    text[:200_000],
+                    length=opts.get("summary_length", "medium"),
+                    language=language,
+                )
+                summary_data["summary"] = overall["summary"]
+                summary_data["key_points"] = overall.get("key_points", [])
+
+                await self._update_status(
+                    task_id, progress=35, message="Summarizing chapters...",
+                )
+                chapter_summaries = await generate_chapter_summaries(
+                    chapters, length="short", language=language,
+                )
+                summary_data["chapters"] = chapter_summaries
+            else:
+                summary_data["summary"] = ""
+                summary_data["key_points"] = []
+                summary_data["chapters"] = [
+                    {
+                        "chapter_number": i + 1,
+                        "title": ch.get("title", f"Chapter {i + 1}"),
+                        "summary": "",
+                        "key_points": [],
+                    }
+                    for i, ch in enumerate(chapters)
+                ]
+
+            # 4. Audiobook ------------------------------------------------------
+            audio_manifest: List[Dict[str, Any]] = []
+            if opts.get("generate_audio", True) and settings.TTS_ENABLED:
+                await self._update_status(
+                    task_id, status=TaskStatus.GENERATING_AUDIO, progress=45,
+                    stage="generating_audio",
+                    message=f"Generating audiobook ({len(chapters)} chapters)...",
+                )
+                voice = opts.get("voice") or detect_voice_for_language(language)
+                total = len(chapters)
+                base_progress = 45
+                span = 55  # 45 -> 100
+                for i, ch in enumerate(chapters):
+                    title = ch.get("title", f"Chapter {i + 1}")
+                    body = ch.get("text", "")[: settings.TTS_MAX_CHARS_PER_CHAPTER]
+                    if not body.strip():
+                        continue
+
+                    filename = f"{i + 1:03d}_{_safe_filename(title, f'chapter_{i+1}')}.mp3"
+                    out_path = audio_dir / filename
+                    try:
+                        await synthesize_to_file(body, out_path, voice=voice)
+                        audio_manifest.append({
+                            "index": i + 1,
+                            "title": title,
+                            "file": filename,
+                            "url": f"/api/v1/audiobooks/{task_id}/audio/{filename}",
+                            "size": out_path.stat().st_size,
+                        })
+                    except Exception as e:
+                        logger.error(f"TTS failed for chapter {i + 1}: {e}", exc_info=True)
+
+                    prog = base_progress + int(((i + 1) / total) * span)
+                    await self._update_status(
+                        task_id, progress=min(prog, 99),
+                        message=f"Audio {i + 1}/{total}: {title[:40]}",
+                    )
+
+            summary_data["audio"] = audio_manifest
+
+            # 5. Persist + complete --------------------------------------------
+            (output_dir / "summary.json").write_text(
+                json.dumps(summary_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            task["result"] = summary_data
+
+            await self._update_status(
+                task_id, status=TaskStatus.COMPLETED, progress=100,
+                stage="completed", message="Processing complete!",
+            )
+            logger.info(f"Task {task_id} completed")
+
+        except AppException as e:
+            await self._update_status(
+                task_id, status=TaskStatus.FAILED, progress=0, message=e.message,
+            )
+            task["error"] = {"code": e.code, "message": e.message}
+            logger.error(f"Task {task_id} failed: {e.message}")
+        except Exception as e:
+            await self._update_status(
+                task_id, status=TaskStatus.FAILED, progress=0,
+                message=f"Unexpected error: {e}",
+            )
+            task["error"] = {"code": "UNKNOWN_ERROR", "message": str(e)}
+            logger.error(f"Task {task_id} failed: {e}", exc_info=True)
+
+    async def _update_status(self, task_id: str, status=None, progress=None,
+                             stage=None, message=None):
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        if status:
+            task["status"] = status
+        if progress is not None:
+            task["progress"] = progress
+        if stage:
+            task["stage"] = stage
+        if message:
+            task["message"] = message
+        task["updated_at"] = datetime.utcnow().isoformat()
+        await self._send_websocket_update(task_id)
+
+    async def _send_websocket_update(self, task_id: str):
+        ws = self.websocket_connections.get(task_id)
+        if not ws:
+            return
+        try:
+            task = self.tasks[task_id]
+            await ws.send_json({
+                "type": "progress",
+                "data": {
+                    "task_id": task_id,
+                    "status": task["status"],
+                    "progress": task["progress"],
+                    "stage": task.get("stage"),
+                    "message": task.get("message"),
+                },
+            })
+        except Exception as e:
+            logger.warning(f"ws send failed {task_id}: {e}")
+            self.websocket_connections.pop(task_id, None)
+
+    def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task = self.tasks.get(task_id)
+        if not task:
+            return None
+        return {
+            "task_id": task["task_id"],
+            "status": task["status"],
+            "progress": task["progress"],
+            "stage": task.get("stage"),
+            "message": task.get("message"),
+            "created_at": task["created_at"],
+            "updated_at": task["updated_at"],
+            "result": task.get("result"),
+            "error": task.get("error"),
+        }
+
+    def cancel_task(self, task_id: str) -> bool:
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            return False
+        task["status"] = TaskStatus.CANCELLED
+        task["message"] = "Task cancelled by user"
+        task["updated_at"] = datetime.utcnow().isoformat()
+        self._cleanup_task_files(task_id)
+        return True
+
+    def delete_task(self, task_id: str) -> bool:
+        if task_id not in self.tasks:
+            return False
+        del self.tasks[task_id]
+        self._cleanup_task_files(task_id)
+        return True
+
+    def _cleanup_task_files(self, task_id: str):
+        task_dir = Path(settings.OUTPUT_DIR) / task_id
+        if task_dir.exists():
+            try:
+                shutil.rmtree(task_dir)
+            except Exception as e:
+                logger.warning(f"cleanup failed {task_id}: {e}")
+
+    def register_websocket(self, task_id: str, websocket):
+        self.websocket_connections[task_id] = websocket
+
+    def unregister_websocket(self, task_id: str):
+        self.websocket_connections.pop(task_id, None)
+
+    def cleanup_old_tasks(self, older_than_hours: Optional[int] = None):
+        hours = older_than_hours or settings.TASK_RETENTION_HOURS
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        to_rm = []
+        for tid, t in self.tasks.items():
+            created = datetime.fromisoformat(t["created_at"])
+            if created < cutoff and t["status"] in [
+                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+            ]:
+                to_rm.append(tid)
+        for tid in to_rm:
+            self.delete_task(tid)
+
+
+task_manager = TaskManager()

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: libro-backend
+    env: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)"
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://libro-frontend.vercel.app,http://localhost:5173
+      - key: MAX_FILE_SIZE
+        value: "419430400"
+      - key: TTS_ENABLED
+        value: "true"
