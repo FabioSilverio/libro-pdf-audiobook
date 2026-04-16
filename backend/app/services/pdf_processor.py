@@ -4,10 +4,17 @@ from typing import Dict, Any, List
 from pathlib import Path
 import re
 import logging
+import shutil
 
 from app.core.exceptions import PDFProcessingError, EncryptedPDFError, EmptyPDFError
 
 logger = logging.getLogger(__name__)
+
+# OCR configuration
+OCR_LANGS = "por+eng+spa"  # combine common languages
+OCR_DPI = 200
+OCR_MIN_CHARS_PER_PAGE = 40  # below this, treat as scanned and OCR
+OCR_MAX_PAGES = 2000  # hard cap to avoid running OCR forever
 
 
 def extract_text(pdf_path: str) -> str:
@@ -35,7 +42,9 @@ def extract_text(pdf_path: str) -> str:
                 raise EncryptedPDFError()
             raise
 
+        page_count = 0
         with pdf_ctx as pdf:
+            page_count = len(pdf.pages)
             # Extract text from each page
             for page_num, page in enumerate(pdf.pages, 1):
                 try:
@@ -48,15 +57,28 @@ def extract_text(pdf_path: str) -> str:
 
         # Combine all text
         full_text = "\n\n".join(text_parts)
-
-        # Clean and normalize text
         cleaned_text = clean_text(full_text)
 
-        # Verify we extracted something
+        # Decide whether we need OCR: either nothing came out, or way too little
+        # per page (likely a scanned PDF).
+        chars_per_page = len(cleaned_text) / max(page_count, 1)
+        if not cleaned_text or chars_per_page < OCR_MIN_CHARS_PER_PAGE:
+            if _ocr_available():
+                logger.info(
+                    f"Text extraction sparse ({len(cleaned_text)} chars over "
+                    f"{page_count} pages). Falling back to OCR."
+                )
+                ocr_text = _ocr_pdf(pdf_path)
+                ocr_cleaned = clean_text(ocr_text)
+                if ocr_cleaned and len(ocr_cleaned) > len(cleaned_text):
+                    cleaned_text = ocr_cleaned
+            else:
+                logger.warning("Sparse text and OCR not available on this host.")
+
         if not cleaned_text or len(cleaned_text.strip()) < 10:
             raise EmptyPDFError()
 
-        logger.info(f"Successfully extracted {len(cleaned_text)} characters from PDF")
+        logger.info(f"Extracted {len(cleaned_text)} characters from PDF")
         return cleaned_text
 
     except EncryptedPDFError:
@@ -66,6 +88,76 @@ def extract_text(pdf_path: str) -> str:
     except Exception as e:
         logger.error(f"PDF extraction failed: {e}")
         raise PDFProcessingError(f"Failed to extract text: {str(e)}")
+
+
+def _ocr_available() -> bool:
+    """Check if OCR stack is available (tesseract + poppler + python libs)."""
+    try:
+        import pytesseract  # noqa: F401
+        import pdf2image  # noqa: F401
+    except Exception as e:
+        logger.info(f"OCR python libs missing: {e}")
+        return False
+    if not shutil.which("tesseract"):
+        logger.info("tesseract binary not found in PATH")
+        return False
+    # pdf2image requires pdftoppm from poppler
+    if not shutil.which("pdftoppm"):
+        logger.info("pdftoppm (poppler) not found in PATH")
+        return False
+    return True
+
+
+def _ocr_pdf(pdf_path: str) -> str:
+    """Run Tesseract OCR over every page of the PDF.
+
+    Converts each page to an image via pdf2image (poppler) then extracts text.
+    This is slow — expect seconds per page.
+    """
+    import pytesseract
+    from pdf2image import convert_from_path
+
+    texts: List[str] = []
+    # Process in batches to keep memory bounded.
+    batch = 5
+    page = 1
+    while page <= OCR_MAX_PAGES:
+        try:
+            images = convert_from_path(
+                pdf_path,
+                dpi=OCR_DPI,
+                first_page=page,
+                last_page=page + batch - 1,
+                fmt="png",
+                thread_count=2,
+            )
+        except Exception as e:
+            logger.warning(f"pdf2image failed at page {page}: {e}")
+            break
+
+        if not images:
+            break
+
+        for i, img in enumerate(images):
+            try:
+                text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+                if text:
+                    texts.append(text)
+            except Exception as e:
+                logger.warning(f"OCR failed at page {page + i}: {e}")
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+
+        if len(images) < batch:
+            break
+        page += batch
+
+    result = "\n\n".join(texts)
+    logger.info(f"OCR produced {len(result)} characters across {page - 1} pages")
+    return result
 
 
 def extract_metadata(pdf_path: str) -> Dict[str, Any]:

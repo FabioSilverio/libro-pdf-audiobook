@@ -1,0 +1,22 @@
+# Railway / Nixpacks build configuration.
+# Installs Tesseract OCR (pt, en, es) + poppler-utils for scanned-PDF OCR.
+
+[phases.setup]
+aptPkgs = [
+  "tesseract-ocr",
+  "tesseract-ocr-por",
+  "tesseract-ocr-eng",
+  "tesseract-ocr-spa",
+  "poppler-utils",
+]
+
+[phases.install]
+cmds = [
+  "python -m venv --copies /opt/venv",
+  ". /opt/venv/bin/activate && pip install --upgrade pip",
+  ". /opt/venv/bin/activate && pip install -r requirements.txt",
+  ". /opt/venv/bin/activate && python -c \"import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)\"",
+]
+
+[start]
+cmd = ". /opt/venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port $PORT"

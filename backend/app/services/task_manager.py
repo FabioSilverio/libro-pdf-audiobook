@@ -77,7 +77,8 @@ class TaskManager:
             # 1. Extract text ---------------------------------------------------
             await self._update_status(
                 task_id, status=TaskStatus.EXTRACTING, progress=5,
-                stage="extracting", message="Reading PDF and extracting text...",
+                stage="extracting",
+                message="Reading PDF (OCR will run if it's scanned — may take a few minutes)...",
             )
             text = await asyncio.to_thread(extract_text, task["file_path"])
             metadata = await asyncio.to_thread(extract_metadata, task["file_path"])
