@@ -43,9 +43,11 @@ export function useTaskProgress(taskId) {
       };
 
       ws.onmessage = (event) => {
+        // Server replies plain text "pong" to our "ping"; ignore non-JSON frames.
+        const raw = event.data;
+        if (typeof raw !== 'string' || !raw.startsWith('{')) return;
         try {
-          const data = JSON.parse(event.data);
-
+          const data = JSON.parse(raw);
           if (data.type === 'progress' || data.type === 'status') {
             const taskData = data.data;
             setStatus(taskData.status);
@@ -54,7 +56,7 @@ export function useTaskProgress(taskId) {
             setMessage(taskData.message || '');
           }
         } catch (err) {
-          console.error('Failed to parse WebSocket message:', err);
+          console.warn('Ignoring non-JSON WS message:', raw);
         }
       };
 

@@ -145,6 +145,7 @@ class TaskManager:
                 total = len(chapters)
                 base_progress = 45
                 span = 55  # 45 -> 100
+
                 for i, ch in enumerate(chapters):
                     title = ch.get("title", f"Chapter {i + 1}")
                     body = ch.get("text", "")[: settings.TTS_MAX_CHARS_PER_CHAPTER]
@@ -153,8 +154,25 @@ class TaskManager:
 
                     filename = f"{i + 1:03d}_{_safe_filename(title, f'chapter_{i+1}')}.mp3"
                     out_path = audio_dir / filename
+
+                    ch_start = base_progress + int((i / total) * span)
+                    ch_end = base_progress + int(((i + 1) / total) * span)
+
+                    def _progress_cb(done, tot, _i=i, _title=title,
+                                     _cs=ch_start, _ce=ch_end):
+                        # Called from inside synthesize_to_file (same loop).
+                        p = _cs + int((done / max(tot, 1)) * (_ce - _cs))
+                        asyncio.create_task(self._update_status(
+                            task_id,
+                            progress=min(p, 99),
+                            message=f"Audio {_i + 1}/{total}: {_title[:40]} "
+                                    f"({done}/{tot} segments)",
+                        ))
+
                     try:
-                        await synthesize_to_file(body, out_path, voice=voice)
+                        await synthesize_to_file(
+                            body, out_path, voice=voice, on_chunk=_progress_cb,
+                        )
                         audio_manifest.append({
                             "index": i + 1,
                             "title": title,
@@ -165,10 +183,9 @@ class TaskManager:
                     except Exception as e:
                         logger.error(f"TTS failed for chapter {i + 1}: {e}", exc_info=True)
 
-                    prog = base_progress + int(((i + 1) / total) * span)
                     await self._update_status(
-                        task_id, progress=min(prog, 99),
-                        message=f"Audio {i + 1}/{total}: {title[:40]}",
+                        task_id, progress=min(ch_end, 99),
+                        message=f"Audio {i + 1}/{total}: {title[:40]} done",
                     )
 
             summary_data["audio"] = audio_manifest

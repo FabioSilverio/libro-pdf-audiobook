@@ -276,14 +276,17 @@ def split_into_chapters(text: str) -> List[Dict[str, Any]]:
     if chapters:
         return chapters
 
-    # Fallback: split long texts into ~N parts of ~15k chars each.
-    if len(text) > 20000:
-        target = max(1, min(20, len(text) // 15000))
-        size = len(text) // target
+    # Fallback: always split long texts into ~N parts so TTS/progress stay responsive.
+    # Aim for parts of ~8k chars (~5-10 min of audio each).
+    if len(text) > 8000:
+        target_size = 8000
+        target = max(2, min(40, -(-len(text) // target_size)))  # ceil
+        size = -(-len(text) // target)
         parts = []
         for i in range(target):
-            chunk = text[i * size:(i + 1) * size if i < target - 1 else len(text)]
-            parts.append({"title": f"Part {i + 1}", "text": chunk.strip()})
-        return parts
+            chunk = text[i * size:(i + 1) * size]
+            if chunk.strip():
+                parts.append({"title": f"Part {i + 1}", "text": chunk.strip()})
+        return parts or [{"title": "Full Text", "text": text}]
 
     return [{"title": "Full Text", "text": text}]
