@@ -50,3 +50,4 @@ htmlcov/
 # Vite
 frontend/dist/
 .vercel
+.env*.local
