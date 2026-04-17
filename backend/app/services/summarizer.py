@@ -252,24 +252,35 @@ def _llm_summarize(text: str, *, length: str, language: str) -> Optional[Dict[st
     if not raw:
         return None
 
-    # Strip accidental code fences.
+    # Strip accidental code fences + leading prose like "Here is the summary:".
     raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
 
+    data = None
+    # 1) Try direct parse.
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Try to locate the first JSON object in the string.
+        pass
+    # 2) Locate the first balanced JSON object.
+    if data is None:
         m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            logger.warning("LLM returned non-JSON output; falling back")
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                pass
+    # 3) Last-ditch: treat the whole response as the summary and synthesize
+    #    key points from its sentences. Better than falling back to extractive.
+    if data is None:
+        logger.info("LLM returned non-JSON; using raw text as summary")
+        sentences = [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+", raw) if s.strip()]
+        if not sentences:
             return None
-        try:
-            data = json.loads(m.group(0))
-        except Exception:
-            return None
+        summary = " ".join(sentences[:8])
+        kp = [s for s in sentences if 6 <= len(s.split()) <= 40][:5]
+        return {"summary": summary, "key_points": kp, "language": language}
 
     summary = (data.get("summary") or "").strip()
     kp_raw = data.get("key_points") or []
