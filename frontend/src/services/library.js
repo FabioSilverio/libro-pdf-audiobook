@@ -105,6 +105,49 @@ export function markLastOpened(taskId) {
   return saveProgress(taskId, { lastOpened: new Date().toISOString() });
 }
 
+// ---------- Export / Import ----------
+
+/**
+ * Export entire library + per-book progress as a JSON blob.
+ * Returns a Blob suitable for download.
+ */
+export function exportLibrary() {
+  const books = getLibrary();
+  const progress = {};
+  for (const b of books) {
+    progress[b.task_id] = getProgress(b.task_id);
+  }
+  const payload = { version: 1, exported_at: new Date().toISOString(), books, progress };
+  return new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+}
+
+/**
+ * Import library from a JSON blob (merges with existing).
+ * Returns the number of books imported.
+ */
+export function importLibrary(jsonStr) {
+  const data = JSON.parse(jsonStr);
+  if (!data?.books || !Array.isArray(data.books)) {
+    throw new Error('Invalid library file');
+  }
+  let count = 0;
+  for (const book of data.books) {
+    if (book?.task_id) {
+      upsertBook(book);
+      count++;
+    }
+  }
+  // Restore per-book progress if present
+  if (data.progress && typeof data.progress === 'object') {
+    for (const [taskId, prog] of Object.entries(data.progress)) {
+      if (prog && typeof prog === 'object') {
+        saveProgress(taskId, prog);
+      }
+    }
+  }
+  return count;
+}
+
 /**
  * Compute a 0-1 progress score for a book based on audio played + chapters read.
  */

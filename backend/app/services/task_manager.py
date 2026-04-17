@@ -44,6 +44,7 @@ class TaskManager:
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.websocket_connections: Dict[str, Any] = {}
         self._load_tasks_from_disk()
+        self._cleanup_uploads()
 
     # ---------------- persistence ----------------
     def _task_file(self, task_id: str) -> Path:
@@ -119,6 +120,24 @@ class TaskManager:
                 f"({resurrected_failed} were marked failed due to restart)."
             )
 
+    def _cleanup_uploads(self) -> None:
+        """Delete any leftover uploaded files to free disk space on startup."""
+        upload_dir = Path(settings.UPLOAD_DIR)
+        if not upload_dir.exists():
+            return
+        removed = 0
+        for f in upload_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in (".pdf", ".epub"):
+                try:
+                    f.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+        if removed:
+            logger.info(f"Cleaned up {removed} leftover uploaded file(s)")
+        # Also auto-clean completed/failed tasks older than retention period.
+        self.cleanup_old_tasks()
+
     def create_task(self, file_path: str, options: Optional[Dict[str, Any]] = None) -> str:
         task_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
@@ -178,6 +197,12 @@ class TaskManager:
                 on_progress=_extract_progress,
             )
             metadata = await asyncio.to_thread(proc.extract_metadata, task["file_path"])
+
+            # Free disk space — we no longer need the uploaded file.
+            try:
+                Path(task["file_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
 
             # Fall back to the uploaded filename (without the .pdf extension)
             # when the PDF has no embedded title — otherwise every book

@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react';
-import { getLibrary, getProgress, removeBook, upsertBook, computeBookProgress } from '../services/library';
+import { useEffect, useState, useRef } from 'react';
+import { getLibrary, getProgress, removeBook, upsertBook, computeBookProgress, exportLibrary, importLibrary } from '../services/library';
 import { resummarizeAudiobook } from '../services/api';
 
 export default function Library({ onOpen, onNew }) {
   const [books, setBooks] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState('');
+  const importRef = useRef(null);
 
   const refresh = () => setBooks(getLibrary());
   useEffect(() => { refresh(); }, []);
@@ -48,12 +49,47 @@ export default function Library({ onOpen, onNew }) {
     setTimeout(() => setRefreshMsg(''), 6000);
   };
 
+  const handleExport = () => {
+    const blob = exportLibrary();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `libro-library-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const count = importLibrary(reader.result);
+        setRefreshMsg(`Imported ${count} book(s) successfully.`);
+        refresh();
+        setTimeout(() => setRefreshMsg(''), 5000);
+      } catch (err) {
+        setRefreshMsg(`Import failed: ${err.message}`);
+        setTimeout(() => setRefreshMsg(''), 5000);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
   if (books.length === 0) {
     return (
       <div className="library-empty">
         <h2>Your library is empty</h2>
         <p>Books you process are saved here locally so you can pick up where you left off.</p>
         <button className="upload-button" onClick={onNew}>Process your first book</button>
+        <div className="library-import-hint">
+          <button className="text-button" onClick={() => importRef.current?.click()}>
+            Import from file
+          </button>
+          <input ref={importRef} type="file" accept=".json" onChange={handleImport} style={{ display: 'none' }} />
+        </div>
       </div>
     );
   }
@@ -71,6 +107,13 @@ export default function Library({ onOpen, onNew }) {
           >
             {refreshing ? 'Refreshing…' : '↻ Refresh summaries'}
           </button>
+          <button className="secondary-button" onClick={handleExport} title="Export library as JSON">
+            ↓ Export
+          </button>
+          <button className="secondary-button" onClick={() => importRef.current?.click()} title="Import library from JSON">
+            ↑ Import
+          </button>
+          <input ref={importRef} type="file" accept=".json" onChange={handleImport} style={{ display: 'none' }} />
           <button className="secondary-button" onClick={onNew}>+ New book</button>
         </div>
       </div>

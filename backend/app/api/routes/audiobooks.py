@@ -152,6 +152,96 @@ async def resummarize_audiobook(task_id: str, length: str = "medium"):
     }
 
 
+@router.post("/{task_id}/recover")
+async def recover_failed_task(task_id: str):
+    """Recover a failed task that already has extracted text / summaries on disk.
+
+    Marks the task as completed so the user can access whatever was generated
+    before the failure (summaries, partial audio, etc.).  Optionally retries
+    audio generation if space is available.
+    """
+    import json as _json
+
+    task = task_manager.tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"error": "Task not found"})
+
+    if task["status"] == TaskStatus.COMPLETED:
+        return {"recovered": False, "message": "Task is already completed"}
+
+    output_dir = Path(settings.OUTPUT_DIR) / task_id
+
+    # 1) Try to load existing summary.json
+    summary_path = output_dir / "summary.json"
+    result = task.get("result") or {}
+    if summary_path.exists():
+        try:
+            result = _json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 2) If no result at all, try to rebuild from extracted text
+    text_file = output_dir / "extracted_text.txt"
+    if not result.get("chapters") and text_file.exists():
+        from app.services.pdf_processor import split_into_chapters
+        from app.services.summarizer import summarize, generate_chapter_summaries, _detect_language
+
+        text = text_file.read_text(encoding="utf-8")
+        if text and len(text.strip()) > 100:
+            language = _detect_language(text)
+            chapters = split_into_chapters(text)
+            overall = await summarize(text[:200_000], length="medium", language=language)
+            ch_summaries = await generate_chapter_summaries(chapters, length="medium", language=language)
+            result["summary"] = overall["summary"]
+            result["key_points"] = overall.get("key_points", [])
+            result["chapters"] = ch_summaries
+            result["language"] = language
+
+    if not result.get("chapters"):
+        raise HTTPException(status_code=410, detail={
+            "error": "No recoverable data found. Please re-upload the file.",
+            "code": "NOTHING_TO_RECOVER",
+        })
+
+    # 3) Collect whatever audio already exists
+    audio_dir = output_dir / "audio"
+    audio_manifest = result.get("audio", [])
+    if audio_dir.exists() and not audio_manifest:
+        for mp3 in sorted(audio_dir.glob("*.mp3")):
+            audio_manifest.append({
+                "file": mp3.name,
+                "url": f"/api/v1/audiobooks/{task_id}/audio/{mp3.name}",
+                "size": mp3.stat().st_size,
+            })
+        result["audio"] = audio_manifest
+
+    # 4) Mark as completed
+    task["result"] = result
+    task["status"] = TaskStatus.COMPLETED
+    task["progress"] = 100
+    task["message"] = "Recovered from failed state"
+    task_manager._persist_task(task_id)
+
+    # Persist the (possibly updated) summary.json too.
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            _json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    logger.info(f"Recovered task {task_id}: {len(result.get('chapters', []))} chapters, {len(audio_manifest)} audio files")
+
+    return {
+        "recovered": True,
+        "task_id": task_id,
+        "title": result.get("metadata", {}).get("title"),
+        "chapters": len(result.get("chapters", [])),
+        "audio_files": len(audio_manifest),
+    }
+
+
 @router.get("/{task_id}/audio/{filename}")
 async def stream_audio(task_id: str, filename: str):
     """Serve a generated MP3 file for a chapter."""
