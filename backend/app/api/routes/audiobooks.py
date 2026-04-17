@@ -49,6 +49,21 @@ async def get_audiobook_metadata(task_id: str):
 
     result = task_status.get("result", {})
 
+    # Build on-demand audio manifest from chapters (even if pre-gen audio
+    # exists we also include the on-demand URLs as a fallback).
+    chapters = result.get("chapters", [])
+    audio = result.get("audio", [])
+    if not audio and chapters:
+        audio = [
+            {
+                "index": ch.get("chapter_number", i + 1),
+                "title": ch.get("title", f"Chapter {i + 1}"),
+                "url": f"/api/v1/audiobooks/{task_id}/audio/chapter/{ch.get('chapter_number', i + 1)}",
+                "on_demand": True,
+            }
+            for i, ch in enumerate(chapters)
+        ]
+
     return {
         "task_id": task_id,
         "title": result.get("metadata", {}).get("title"),
@@ -57,8 +72,8 @@ async def get_audiobook_metadata(task_id: str):
         "language": result.get("language"),
         "summary": result.get("summary"),
         "key_points": result.get("key_points", []),
-        "chapters": result.get("chapters", []),
-        "audio": result.get("audio", []),
+        "chapters": chapters,
+        "audio": audio,
         "created_at": task_status["created_at"],
         "text_available": True,
     }
@@ -256,10 +271,93 @@ async def recover_failed_task(task_id: str):
     }
 
 
+@router.get("/{task_id}/audio/chapter/{chapter_number}")
+async def stream_chapter_audio(task_id: str, chapter_number: int):
+    """Generate and serve audio for a single chapter on-demand.
+
+    The MP3 is synthesized the first time it is requested (cached on disk
+    for subsequent plays).  Old cached files are automatically cleaned up
+    by the disk-management system when space runs low.
+    """
+    from app.services.edge_tts_generator import synthesize_to_file, detect_voice_for_language
+
+    task = task_manager.tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Task not completed yet")
+
+    result = task.get("result") or {}
+    chapters = result.get("chapters", [])
+
+    ch = None
+    for c in chapters:
+        if c.get("chapter_number") == chapter_number:
+            ch = c
+            break
+    if not ch:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found")
+
+    # Build filename
+    title = ch.get("title", f"Chapter {chapter_number}")
+    import re
+    safe_title = re.sub(r"[^A-Za-z0-9_\- ]+", "", title).strip().replace(" ", "_")[:60] or f"chapter_{chapter_number}"
+    filename = f"{chapter_number:03d}_{safe_title}.mp3"
+
+    audio_dir = Path(settings.OUTPUT_DIR) / task_id / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / filename
+
+    # Return cached file if it exists
+    if audio_path.exists() and audio_path.stat().st_size > 0:
+        return FileResponse(
+            str(audio_path), media_type="audio/mpeg",
+            filename=filename, headers={"Accept-Ranges": "bytes"},
+        )
+
+    # Need the chapter text from extracted_text or full_text in result
+    text = ch.get("full_text", "")
+    if not text:
+        text_file = Path(settings.OUTPUT_DIR) / task_id / "extracted_text.txt"
+        if text_file.exists():
+            full = text_file.read_text(encoding="utf-8")
+            # Re-split to get this chapter's text
+            from app.services.pdf_processor import split_into_chapters
+            splits = split_into_chapters(full)
+            idx = chapter_number - 1
+            if 0 <= idx < len(splits):
+                text = splits[idx].get("text", "")
+
+    if not text or len(text.strip()) < 10:
+        raise HTTPException(status_code=410, detail="Chapter text not available for TTS")
+
+    text = text[:settings.TTS_MAX_CHARS_PER_CHAPTER]
+    voice = result.get("voice") or detect_voice_for_language(result.get("language", "pt"))
+
+    # Free disk space before generating
+    task_manager.ensure_disk_space(needed_mb=30)
+
+    try:
+        await synthesize_to_file(text, audio_path, voice=voice)
+    except OSError as e:
+        if "No space left" in str(e):
+            # Emergency cleanup + retry once
+            task_manager.ensure_disk_space(needed_mb=80)
+            await synthesize_to_file(text, audio_path, voice=voice)
+        else:
+            raise
+
+    logger.info(f"Generated audio for {task_id} ch {chapter_number} ({audio_path.stat().st_size} bytes)")
+
+    return FileResponse(
+        str(audio_path), media_type="audio/mpeg",
+        filename=filename, headers={"Accept-Ranges": "bytes"},
+    )
+
+
 @router.get("/{task_id}/audio/{filename}")
 async def stream_audio(task_id: str, filename: str):
-    """Serve a generated MP3 file for a chapter."""
-    # Prevent path traversal
+    """Serve a pre-generated MP3 file (legacy path for older tasks)."""
     safe_name = Path(filename).name
     audio_path = Path(settings.OUTPUT_DIR) / task_id / "audio" / safe_name
     if not audio_path.exists() or audio_path.suffix.lower() != ".mp3":

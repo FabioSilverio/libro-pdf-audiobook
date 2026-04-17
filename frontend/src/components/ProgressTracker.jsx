@@ -8,7 +8,6 @@ import { useTaskProgress } from '../hooks/useTaskProgress';
 const STAGES = [
   { key: 'extracting', icon: '📖', label: 'Extracting text', desc: 'Reading pages and extracting content' },
   { key: 'summarizing', icon: '🤖', label: 'AI Summary', desc: 'Generating chapter summaries with AI' },
-  { key: 'generating_audio', icon: '🔊', label: 'Audiobook', desc: 'Converting text to speech (MP3)' },
 ];
 
 const TIPS = [
@@ -17,7 +16,7 @@ const TIPS = [
   'You can close this tab and come back — your task is saved.',
   'Scanned PDFs take longer because each page needs OCR.',
   'Summaries are generated per chapter with AI key-points.',
-  'Audio is generated chapter by chapter so you can listen as soon as the first is ready.',
+  'Audio is generated on-demand when you press play — no waiting for the whole book!',
   'Your library is saved locally in this browser.',
 ];
 
