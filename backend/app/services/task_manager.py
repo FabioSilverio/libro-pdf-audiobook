@@ -139,6 +139,9 @@ class TaskManager:
         self.cleanup_old_tasks()
 
     def create_task(self, file_path: str, options: Optional[Dict[str, Any]] = None) -> str:
+        # Proactively free disk before heavy processing.
+        self.ensure_disk_space(needed_mb=80)
+
         task_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
         self.tasks[task_id] = {
@@ -275,6 +278,9 @@ class TaskManager:
                 ]
 
             # 4. Audiobook ------------------------------------------------------
+            # Free disk proactively — audio is the biggest consumer.
+            self.ensure_disk_space(needed_mb=100)
+
             audio_manifest: List[Dict[str, Any]] = []
             if opts.get("generate_audio", True) and settings.TTS_ENABLED:
                 await self._update_status(
@@ -457,6 +463,59 @@ class TaskManager:
                 to_rm.append(tid)
         for tid in to_rm:
             self.delete_task(tid)
+        if to_rm:
+            logger.info(f"Time-based cleanup: removed {len(to_rm)} old task(s)")
+
+    # ---- Disk space management ----
+
+    def _dir_size_mb(self, path: Path) -> float:
+        """Return total size of a directory tree in MB."""
+        total = 0
+        try:
+            for f in path.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except Exception:
+            pass
+        return total / (1024 * 1024)
+
+    def ensure_disk_space(self, needed_mb: float = 50) -> None:
+        """Free disk space by purging oldest completed tasks until we have
+        at least `needed_mb` MB free (relative to MAX_DISK_USAGE_MB).
+
+        Called automatically before starting a new task.
+        """
+        output_dir = Path(settings.OUTPUT_DIR)
+        max_mb = settings.MAX_DISK_USAGE_MB
+
+        current_mb = self._dir_size_mb(output_dir)
+        if current_mb + needed_mb <= max_mb:
+            return  # plenty of room
+
+        # Build list of purgeable tasks (completed/failed), oldest first.
+        purgeable = []
+        for tid, t in self.tasks.items():
+            if t["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                task_dir = output_dir / tid
+                size = self._dir_size_mb(task_dir) if task_dir.exists() else 0
+                purgeable.append((tid, t["created_at"], size))
+
+        purgeable.sort(key=lambda x: x[1])  # oldest first
+
+        freed = 0
+        removed = []
+        for tid, _, size in purgeable:
+            if current_mb - freed + needed_mb <= max_mb:
+                break
+            self.delete_task(tid)
+            freed += size
+            removed.append(tid)
+
+        if removed:
+            logger.info(
+                f"Disk cleanup: purged {len(removed)} task(s), "
+                f"freed ~{freed:.1f} MB (was {current_mb:.1f} MB, cap {max_mb} MB)"
+            )
 
 
 task_manager = TaskManager()

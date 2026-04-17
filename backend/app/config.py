@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_GENERAL: int = 100
 
     # Task Management
-    TASK_RETENTION_HOURS: int = 12
+    TASK_RETENTION_HOURS: int = 6
+    MAX_DISK_USAGE_MB: int = 400  # auto-purge oldest tasks when exceeded
 
     class Config:
         env_file = ".env"
