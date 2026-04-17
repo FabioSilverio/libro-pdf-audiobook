@@ -180,6 +180,7 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
         "model": model,
         "temperature": 0.3,
         "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -223,11 +224,13 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
 
 
 _LLM_SYSTEM_PROMPT = (
-    "You are an expert literary analyst. Your job is to produce high-quality, "
-    "faithful summaries of book chapters and books. Never invent facts that "
-    "aren't supported by the source text. Write in the same language as the "
-    "source. Prefer clear, active prose over jargon. Return *only* valid "
-    "JSON in the requested schema — no markdown fences, no preamble."
+    "You are an expert literary analyst. Produce faithful, well-written "
+    "summaries of books and book chapters. Never invent facts not in the "
+    "source. Write in the same language as the source. "
+    "You must respond with a single valid JSON object and nothing else — "
+    "no prose, no markdown, no code fences. "
+    "The JSON must match exactly: "
+    '{"summary": "string", "key_points": ["string", "string", ...]}'
 )
 
 
