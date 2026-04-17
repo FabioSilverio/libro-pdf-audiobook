@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
@@ -29,6 +31,12 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _NLTK_READY = False
+
+# Throttle LLM calls to stay under free-tier rate limits (Groq free tier is
+# ~30 req/min and has a TPM cap). 1.5s between calls keeps us safe.
+_LLM_MIN_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "1.5"))
+_llm_lock = threading.Lock()
+_llm_last_call_ts = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +142,25 @@ def _llm_is_configured() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
+def _throttle_llm() -> None:
+    """Block if needed so consecutive LLM calls respect the min-interval."""
+    global _llm_last_call_ts
+    with _llm_lock:
+        now = time.monotonic()
+        wait = _LLM_MIN_INTERVAL_S - (now - _llm_last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _llm_last_call_ts = time.monotonic()
+
+
 def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]:
     """Call any OpenAI-compatible chat-completions endpoint. Returns None on
-    failure so the caller can fall back to the extractive backend."""
+    failure so the caller can fall back to the extractive backend.
+
+    Handles free-tier rate-limits by (1) enforcing a client-side min-interval
+    between calls and (2) retrying once on HTTP 429 using any Retry-After
+    hint the server provides.
+    """
     try:
         import httpx
     except Exception as e:
@@ -148,31 +172,43 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
         return None
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    url = f"{base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
 
-    try:
-        r = httpx.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "temperature": 0.3,
-                "max_tokens": max_tokens,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            },
-            timeout=60.0,
-        )
-        r.raise_for_status()
-        payload = r.json()
-        return payload["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.warning(f"LLM call failed ({model}): {e}")
-        return None
+    for attempt in range(2):
+        _throttle_llm()
+        try:
+            r = httpx.post(url, headers=headers, json=body, timeout=60.0)
+            if r.status_code == 429:
+                retry_after = float(r.headers.get("retry-after", "2"))
+                retry_after = min(max(retry_after, 1.0), 10.0)
+                logger.info(f"LLM 429; sleeping {retry_after}s then retrying")
+                time.sleep(retry_after)
+                continue
+            if r.status_code == 413:
+                logger.warning(
+                    f"LLM 413 payload too large — giving up, falling back to extractive"
+                )
+                return None
+            r.raise_for_status()
+            payload = r.json()
+            return payload["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.warning(f"LLM call failed ({model}): {e}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return None
+    return None
 
 
 _LLM_SYSTEM_PROMPT = (
@@ -187,8 +223,10 @@ _LLM_SYSTEM_PROMPT = (
 def _llm_summarize(text: str, *, length: str, language: str) -> Optional[Dict[str, Any]]:
     """Abstractive summary via LLM. Returns {summary, key_points} or None on failure."""
     word_target = _length_to_words(length)
-    # LLM input budget — keep well under typical 16k-context limits.
-    snippet = text[:45_000]
+    # LLM input budget — Groq free tier on llama 8B has a 12-20k TPM ceiling
+    # and some models cap per-request tokens aggressively. 12k chars ≈ 3k
+    # tokens which fits comfortably.
+    snippet = text[:12_000]
     user_prompt = (
         f"Summarize the following text. Target length: about {word_target} words. "
         f"Write in {language}. Then list 4–6 concise, concrete key points "
@@ -335,7 +373,9 @@ def summarize_sync(text: str, length: str = "medium", language: str = "auto") ->
         lang = _detect_language(text)
 
     # Keep summarizer input bounded; sample from long texts.
-    text = _sample_long_text(text, max_chars=40_000)
+    # Smaller cap when LLM is configured (Groq free-tier friendly).
+    cap = 18_000 if _llm_is_configured() else 40_000
+    text = _sample_long_text(text, max_chars=cap)
 
     if _llm_is_configured():
         res = _llm_summarize(text, length=length, language=lang)
