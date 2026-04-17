@@ -32,9 +32,11 @@ logger = logging.getLogger(__name__)
 
 _NLTK_READY = False
 
-# Throttle LLM calls to stay under free-tier rate limits (Groq free tier is
-# ~30 req/min and has a TPM cap). 1.5s between calls keeps us safe.
-_LLM_MIN_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "1.5"))
+# Throttle LLM calls to stay under free-tier rate limits.
+# Groq free tier: 30 req/min AND 30k TPM for llama-3.1-8b-instant. The TPM
+# ceiling is what bites — ~1500-token prompts at 5s intervals gives
+# ~18k TPM which sits comfortably under the cap.
+_LLM_MIN_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "5.0"))
 _llm_lock = threading.Lock()
 _llm_last_call_ts = 0.0
 
@@ -184,30 +186,39 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
         ],
     }
 
-    for attempt in range(2):
+    # Try up to 4 times on 429; Groq honors Retry-After seconds.
+    for attempt in range(4):
         _throttle_llm()
         try:
             r = httpx.post(url, headers=headers, json=body, timeout=60.0)
             if r.status_code == 429:
-                retry_after = float(r.headers.get("retry-after", "2"))
-                retry_after = min(max(retry_after, 1.0), 10.0)
-                logger.info(f"LLM 429; sleeping {retry_after}s then retrying")
-                time.sleep(retry_after)
+                retry_after = r.headers.get("retry-after") or r.headers.get("x-ratelimit-reset") or "4"
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = 4.0
+                wait = min(max(wait, 2.0), 30.0)
+                # Also update the global last-call so the next throttle block
+                # doesn't immediately fire another request.
+                global _llm_last_call_ts
+                with _llm_lock:
+                    _llm_last_call_ts = time.monotonic() + wait
+                logger.info(f"LLM 429 (attempt {attempt + 1}); sleeping {wait}s")
+                time.sleep(wait)
                 continue
             if r.status_code == 413:
-                logger.warning(
-                    f"LLM 413 payload too large — giving up, falling back to extractive"
-                )
+                logger.warning("LLM 413 payload too large — falling back to extractive")
                 return None
             r.raise_for_status()
             payload = r.json()
             return payload["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning(f"LLM call failed ({model}): {e}")
-            if attempt == 0:
-                time.sleep(2)
+            logger.warning(f"LLM call failed ({model}) attempt {attempt + 1}: {e}")
+            if attempt < 3:
+                time.sleep(3)
                 continue
             return None
+    logger.warning(f"LLM call exhausted retries ({model})")
     return None
 
 
@@ -223,10 +234,9 @@ _LLM_SYSTEM_PROMPT = (
 def _llm_summarize(text: str, *, length: str, language: str) -> Optional[Dict[str, Any]]:
     """Abstractive summary via LLM. Returns {summary, key_points} or None on failure."""
     word_target = _length_to_words(length)
-    # LLM input budget — Groq free tier on llama 8B has a 12-20k TPM ceiling
-    # and some models cap per-request tokens aggressively. 12k chars ≈ 3k
-    # tokens which fits comfortably.
-    snippet = text[:12_000]
+    # LLM input budget — Groq free tier has 30k TPM so we cap at ~1.5k tokens
+    # per prompt (~6k chars) to leave headroom for parallel calls + output.
+    snippet = text[:6_000]
     user_prompt = (
         f"Summarize the following text. Target length: about {word_target} words. "
         f"Write in {language}. Then list 4–6 concise, concrete key points "
@@ -238,7 +248,7 @@ def _llm_summarize(text: str, *, length: str, language: str) -> Optional[Dict[st
         f"--- TEXT START ---\n{snippet}\n--- TEXT END ---"
     )
 
-    raw = _llm_call(_LLM_SYSTEM_PROMPT, user_prompt, max_tokens=1200)
+    raw = _llm_call(_LLM_SYSTEM_PROMPT, user_prompt, max_tokens=800)
     if not raw:
         return None
 
