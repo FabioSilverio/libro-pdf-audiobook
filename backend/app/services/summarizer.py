@@ -40,6 +40,11 @@ _LLM_MIN_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "5.0"))
 _llm_lock = threading.Lock()
 _llm_last_call_ts = 0.0
 
+# Circuit breaker: disable LLM after repeated 429s so we don't stall for
+# minutes. Resets after a cooldown period.
+_llm_circuit_open_until = 0.0  # monotonic timestamp; 0 = circuit closed
+_LLM_CIRCUIT_COOLDOWN_S = 300  # 5 min cooldown after tripping
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -187,8 +192,14 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
         ],
     }
 
-    # Try up to 4 times on 429; Groq honors Retry-After seconds.
-    for attempt in range(4):
+    global _llm_circuit_open_until, _llm_last_call_ts
+
+    # Circuit breaker: skip LLM entirely if recently rate-limited.
+    if time.monotonic() < _llm_circuit_open_until:
+        return None
+
+    # Try up to 2 times on 429 (fast fail, then fall back to extractive).
+    for attempt in range(2):
         _throttle_llm()
         try:
             r = httpx.post(url, headers=headers, json=body, timeout=60.0)
@@ -198,10 +209,7 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
                     wait = float(retry_after)
                 except ValueError:
                     wait = 4.0
-                wait = min(max(wait, 2.0), 30.0)
-                # Also update the global last-call so the next throttle block
-                # doesn't immediately fire another request.
-                global _llm_last_call_ts
+                wait = min(max(wait, 2.0), 10.0)
                 with _llm_lock:
                     _llm_last_call_ts = time.monotonic() + wait
                 logger.info(f"LLM 429 (attempt {attempt + 1}); sleeping {wait}s")
@@ -215,11 +223,13 @@ def _llm_call(system: str, user: str, *, max_tokens: int = 900) -> Optional[str]
             return payload["choices"][0]["message"]["content"].strip()
         except Exception as e:
             logger.warning(f"LLM call failed ({model}) attempt {attempt + 1}: {e}")
-            if attempt < 3:
+            if attempt < 1:
                 time.sleep(3)
                 continue
             return None
-    logger.warning(f"LLM call exhausted retries ({model})")
+    # Trip circuit breaker so subsequent calls skip LLM immediately.
+    _llm_circuit_open_until = time.monotonic() + _LLM_CIRCUIT_COOLDOWN_S
+    logger.warning(f"LLM call exhausted retries ({model}); circuit open for {_LLM_CIRCUIT_COOLDOWN_S}s")
     return None
 
 
