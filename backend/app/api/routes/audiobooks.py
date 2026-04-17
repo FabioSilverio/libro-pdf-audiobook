@@ -64,6 +64,94 @@ async def get_audiobook_metadata(task_id: str):
     }
 
 
+@router.post("/{task_id}/resummarize")
+async def resummarize_audiobook(task_id: str, length: str = "medium"):
+    """Re-generate summaries and key points for an already-processed book.
+
+    Uses the extracted text still on disk (or re-reads the source PDF if
+    needed) and runs the current, improved summarizer. The task's result is
+    updated in-place so the frontend can refresh its cached library entry.
+    """
+    from app.services.pdf_processor import split_into_chapters, extract_text
+    from app.services.summarizer import summarize, generate_chapter_summaries, _detect_language
+
+    task_status = task_manager.get_task_status(task_id)
+    if not task_status:
+        raise HTTPException(status_code=404, detail={
+            "error": f"Task {task_id} not found", "code": "TASK_NOT_FOUND",
+        })
+
+    task = task_manager.tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"error": "Task state unavailable"})
+
+    output_dir = Path(settings.OUTPUT_DIR) / task_id
+    text_file = output_dir / "extracted_text.txt"
+
+    # Prefer the cached extracted text; fall back to re-extracting the PDF
+    # (handles older tasks whose extracted_text.txt was wiped before the
+    # persistent volume was added).
+    text = ""
+    if text_file.exists():
+        try:
+            text = text_file.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Couldn't read cached text for {task_id}: {e}")
+
+    if not text or len(text.strip()) < 200:
+        pdf_path = task.get("file_path")
+        if pdf_path and Path(pdf_path).exists():
+            try:
+                text = extract_text(pdf_path)
+                try:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    text_file.write_text(text, encoding="utf-8")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Re-extract failed for {task_id}: {e}")
+
+    if not text or len(text.strip()) < 200:
+        raise HTTPException(status_code=410, detail={
+            "error": "Source text no longer available for this book. Please re-upload.",
+            "code": "TEXT_UNAVAILABLE",
+        })
+
+    language = task.get("options", {}).get("language", "auto")
+    if language == "auto":
+        language = _detect_language(text)
+
+    # Re-summarize overall + per chapter.
+    overall = await summarize(text, length=length, language=language)
+    chapters = split_into_chapters(text)
+    chapter_summaries = await generate_chapter_summaries(
+        chapters, length=length, language=language,
+    )
+
+    # Merge back into the stored result, preserving audio + metadata.
+    result = task.get("result") or {}
+    result["summary"] = overall["summary"]
+    result["key_points"] = overall.get("key_points", [])
+    result["chapters"] = chapter_summaries
+    result["language"] = language
+    task["result"] = result
+    task_manager._persist_task(task_id)
+    logger.info(f"Re-summarized task {task_id}: {len(chapter_summaries)} chapters")
+
+    return {
+        "task_id": task_id,
+        "title": result.get("metadata", {}).get("title"),
+        "author": result.get("metadata", {}).get("author"),
+        "page_count": result.get("metadata", {}).get("page_count"),
+        "language": language,
+        "summary": result["summary"],
+        "key_points": result["key_points"],
+        "chapters": result["chapters"],
+        "audio": result.get("audio", []),
+        "created_at": task_status["created_at"],
+    }
+
+
 @router.get("/{task_id}/audio/{filename}")
 async def stream_audio(task_id: str, filename: str):
     """Serve a generated MP3 file for a chapter."""

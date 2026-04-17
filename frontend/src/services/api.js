@@ -133,6 +133,20 @@ export const getSummary = async (taskId) => {
 };
 
 /**
+ * Regenerate summaries for an existing audiobook using the latest summarizer.
+ * @param {string} taskId
+ * @param {string} length - "short" | "medium" | "long"
+ */
+export const resummarizeAudiobook = async (taskId, length = 'medium') => {
+  const response = await api.post(
+    `/api/v1/audiobooks/${taskId}/resummarize`,
+    null,
+    { params: { length }, timeout: 0 }
+  );
+  return response.data;
+};
+
+/**
  * Delete an audiobook
  * @param {string} taskId - Task identifier
  * @returns {Promise<Object>} Deletion result
