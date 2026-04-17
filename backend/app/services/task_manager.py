@@ -13,11 +13,7 @@ from typing import Any, Dict, List, Optional
 from app.config import settings
 from app.core.exceptions import AppException
 from app.models import TaskStatus
-from app.services.pdf_processor import (
-    extract_text,
-    extract_metadata,
-    split_into_chapters,
-)
+from app.services import pdf_processor, epub_processor
 from app.services.summarizer import (
     summarize,
     generate_chapter_summaries,
@@ -157,18 +153,18 @@ class TaskManager:
 
         try:
             # 1. Extract text ---------------------------------------------------
+            is_epub = task["file_path"].lower().endswith(".epub")
+            file_label = "EPUB" if is_epub else "PDF"
+            proc = epub_processor if is_epub else pdf_processor
+
             await self._update_status(
                 task_id, status=TaskStatus.EXTRACTING, progress=5,
                 stage="extracting",
-                message="Reading PDF (OCR will run if it's scanned — may take a few minutes)...",
+                message=f"Reading {file_label}" + ("" if is_epub else " (OCR will run if scanned)") + "...",
             )
-            # Progress callback invoked from inside extract_text's worker
-            # thread (especially during slow OCR). Schedule the async
-            # _update_status back onto the main loop.
             main_loop = asyncio.get_running_loop()
 
             def _extract_progress(stage: str, done: int, total: int, message: str):
-                # Map 0..total into the 5..20 progress band.
                 pct = 5 + int((done / max(total, 1)) * 15)
                 asyncio.run_coroutine_threadsafe(
                     self._update_status(task_id, progress=pct, message=message),
@@ -176,12 +172,12 @@ class TaskManager:
                 )
 
             text = await asyncio.to_thread(
-                extract_text,
+                proc.extract_text,
                 task["file_path"],
                 ocr_lang=opts.get("language", "auto"),
                 on_progress=_extract_progress,
             )
-            metadata = await asyncio.to_thread(extract_metadata, task["file_path"])
+            metadata = await asyncio.to_thread(proc.extract_metadata, task["file_path"])
 
             # Fall back to the uploaded filename (without the .pdf extension)
             # when the PDF has no embedded title — otherwise every book
@@ -208,7 +204,12 @@ class TaskManager:
             )
 
             # 2. Detect chapters ------------------------------------------------
-            chapters = await asyncio.to_thread(split_into_chapters, text)
+            if is_epub:
+                chapters = await asyncio.to_thread(
+                    epub_processor.split_into_chapters, task["file_path"], text,
+                )
+            else:
+                chapters = await asyncio.to_thread(pdf_processor.split_into_chapters, text)
             logger.info(f"Task {task_id}: {len(chapters)} chapters detected")
 
             # 3. Summarization --------------------------------------------------

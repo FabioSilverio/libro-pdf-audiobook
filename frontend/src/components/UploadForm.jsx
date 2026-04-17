@@ -34,8 +34,9 @@ export default function UploadForm({ onUploadSuccess, onUploadError }) {
 
   const validateFile = (f) => {
     setError('');
-    if (!f.name.toLowerCase().endsWith('.pdf')) {
-      setError('Only PDF files are accepted');
+    const name = f.name.toLowerCase();
+    if (!name.endsWith('.pdf') && !name.endsWith('.epub')) {
+      setError('Only PDF and EPUB files are accepted');
       return false;
     }
     if (f.size > MAX_SIZE) {
@@ -94,8 +95,8 @@ export default function UploadForm({ onUploadSuccess, onUploadError }) {
 
   return (
     <div className="upload-form">
-      <h2>Upload a PDF</h2>
-      <p className="subtitle">Up to 400 MB. We'll do the rest.</p>
+      <h2>Upload a Book</h2>
+      <p className="subtitle">PDF or EPUB, up to 400 MB. We'll do the rest.</p>
 
       <div
         className={`drop-zone ${isDragging ? 'dragging' : ''} ${file ? 'has-file' : ''}`}
@@ -107,7 +108,7 @@ export default function UploadForm({ onUploadSuccess, onUploadError }) {
       >
         {file ? (
           <div className="file-info">
-            <div className="file-icon">📄</div>
+            <div className="file-icon">{file.name.toLowerCase().endsWith('.epub') ? '📖' : '📄'}</div>
             <div className="file-details">
               <div className="file-name">{file.name}</div>
               <div className="file-size">{(file.size / 1024 / 1024).toFixed(2)} MB</div>
@@ -125,15 +126,15 @@ export default function UploadForm({ onUploadSuccess, onUploadError }) {
         ) : (
           <div className="drop-message">
             <div className="drop-icon">⇪</div>
-            <p>Drop your PDF here</p>
+            <p>Drop your file here</p>
             <p className="drop-subtext">or click to browse</p>
-            <p className="file-limits">Max 400 MB · PDF only</p>
+            <p className="file-limits">Max 400 MB · PDF or EPUB</p>
           </div>
         )}
         <input
           id="file-input"
           type="file"
-          accept=".pdf,application/pdf"
+          accept=".pdf,.epub,application/pdf,application/epub+zip"
           onChange={handleFileInput}
           style={{ display: 'none' }}
           disabled={isUploading}

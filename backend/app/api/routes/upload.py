@@ -1,4 +1,7 @@
-"""File upload API endpoints with streaming to disk (handles up to 400MB)."""
+"""File upload API endpoints with streaming to disk (handles up to 400MB).
+
+Accepts PDF (.pdf) and EPUB (.epub) files.
+"""
 import uuid
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
@@ -13,10 +16,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/upload", tags=["upload"])
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+ALLOWED_EXTENSIONS = {".pdf", ".epub"}
+# Magic bytes for quick validation
+_PDF_MAGIC = b"%PDF-"
+_EPUB_MAGIC = b"PK"  # EPUB is a ZIP archive starting with PK
 
 
 @router.post("", response_model=UploadResponse)
-async def upload_pdf(
+async def upload_file(
     file: UploadFile = File(...),
     summarize: bool = Form(True),
     summary_length: str = Form("medium"),
@@ -24,18 +31,25 @@ async def upload_pdf(
     generate_audio: bool = Form(True),
     language: str = Form("auto"),
 ):
-    """Upload a PDF file (streamed to disk) and start processing.
+    """Upload a PDF or EPUB file (streamed to disk) and start processing.
 
     Supports up to MAX_FILE_SIZE bytes (default 400MB).
     """
-    if not file.filename or not file.filename.lower().endswith('.pdf'):
+    if not file.filename:
         raise HTTPException(
             status_code=422,
-            detail={"error": "Only PDF files are accepted", "code": "INVALID_FILE_TYPE"}
+            detail={"error": "No file provided", "code": "NO_FILE"}
+        )
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "Only PDF and EPUB files are accepted", "code": "INVALID_FILE_TYPE"}
         )
 
     file_id = str(uuid.uuid4())
-    file_path = Path(settings.UPLOAD_DIR) / f"{file_id}.pdf"
+    file_path = Path(settings.UPLOAD_DIR) / f"{file_id}{ext}"
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_size = 0
@@ -49,12 +63,16 @@ async def upload_pdf(
                 # Validate PDF magic bytes on first chunk
                 if not first_chunk_checked:
                     first_chunk_checked = True
-                    if not chunk.startswith(b'%PDF-'):
+                    magic_ok = (
+                        (ext == ".pdf" and chunk.startswith(_PDF_MAGIC)) or
+                        (ext == ".epub" and chunk.startswith(_EPUB_MAGIC))
+                    )
+                    if not magic_ok:
                         out.close()
                         file_path.unlink(missing_ok=True)
                         raise HTTPException(
                             status_code=422,
-                            detail={"error": "Invalid PDF file format", "code": "INVALID_PDF"}
+                            detail={"error": f"Invalid {ext.upper().lstrip('.')} file format", "code": "INVALID_FILE"}
                         )
                 total_size += len(chunk)
                 if total_size > settings.MAX_FILE_SIZE:
@@ -112,8 +130,9 @@ async def upload_pdf(
 async def validate_upload(filename: str, size: int):
     """Client-side validation helper."""
     errors = []
-    if not filename.lower().endswith('.pdf'):
-        errors.append("Only PDF files are accepted")
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        errors.append("Only PDF and EPUB files are accepted")
     if size > settings.MAX_FILE_SIZE:
         errors.append(f"File exceeds maximum size of {settings.MAX_FILE_SIZE // (1024*1024)}MB")
     if size < 1024:
