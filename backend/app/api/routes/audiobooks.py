@@ -180,18 +180,27 @@ async def recover_failed_task(task_id: str):
         except Exception:
             pass
 
-    # 2) If no result at all, try to rebuild from extracted text
+    # 2) If no result at all, try to rebuild from extracted text (quick extractive only)
     text_file = output_dir / "extracted_text.txt"
     if not result.get("chapters") and text_file.exists():
         from app.services.pdf_processor import split_into_chapters
-        from app.services.summarizer import summarize, generate_chapter_summaries, _detect_language
+        from app.services.summarizer import summarize_sync, _detect_language
 
         text = text_file.read_text(encoding="utf-8")
         if text and len(text.strip()) > 100:
             language = _detect_language(text)
             chapters = split_into_chapters(text)
-            overall = await summarize(text[:200_000], length="medium", language=language)
-            ch_summaries = await generate_chapter_summaries(chapters, length="medium", language=language)
+            overall = summarize_sync(text[:200_000], length="medium", language=language)
+            # Build quick chapter stubs so the book is viewable.
+            ch_summaries = []
+            for i, ch in enumerate(chapters):
+                ch_sum = summarize_sync(ch.get("text", "")[:30_000], length="medium", language=language)
+                ch_summaries.append({
+                    "chapter_number": i + 1,
+                    "title": ch.get("title", f"Chapter {i + 1}"),
+                    "summary": ch_sum.get("summary", ""),
+                    "key_points": ch_sum.get("key_points", []),
+                })
             result["summary"] = overall["summary"]
             result["key_points"] = overall.get("key_points", [])
             result["chapters"] = ch_summaries
