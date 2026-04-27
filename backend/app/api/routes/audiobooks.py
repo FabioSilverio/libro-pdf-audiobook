@@ -15,6 +15,28 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/audiobooks", tags=["audiobooks"])
 
 
+def _norm_chapter_num(value) -> int | None:
+    """Coerce JSON/primitive chapter_number to int for reliable comparisons."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_chapter_number(a, b) -> bool:
+    """True if a and b refer to the same chapter index (handles str vs int in JSON)."""
+    na, nb = _norm_chapter_num(a), _norm_chapter_num(b)
+    if na is not None and nb is not None:
+        return na == nb
+    return (a is not None and b is not None) and (str(a) == str(b))
+
+
 def _chapter_text_path(task_id: str) -> Path:
     return Path(settings.OUTPUT_DIR) / task_id / "chapter_texts.json"
 
@@ -32,10 +54,30 @@ def _load_chapter_texts(task_id: str) -> list[dict]:
         return []
 
 
+def _load_summary_file(task_id: str) -> dict | None:
+    p = Path(settings.OUTPUT_DIR) / task_id / "summary.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug(f"Could not read summary.json for {task_id}: {e}")
+        return None
+
+
 def _find_chapter_text(task_id: str, chapter_number: int) -> str:
-    for ch in _load_chapter_texts(task_id):
-        if ch.get("chapter_number") == chapter_number:
-            return ch.get("text", "")
+    raw = _load_chapter_texts(task_id)
+    n = _norm_chapter_num(chapter_number) or chapter_number
+    for ch in raw:
+        if _same_chapter_number(ch.get("chapter_number"), n):
+            t = (ch.get("text") or "").strip()
+            if t:
+                return t
+    # Last resort: manifest is ordered; some legacy files use inconsistent keys.
+    if raw and isinstance(n, int) and 1 <= n <= len(raw):
+        t = (raw[n - 1].get("text") or "").strip()
+        if t:
+            return t
     return ""
 
 
@@ -335,11 +377,17 @@ async def stream_chapter_audio(task_id: str, chapter_number: int):
     result = task.get("result") or {}
     chapters = result.get("chapters", [])
 
+    n = _norm_chapter_num(chapter_number)
+    if n is None:
+        n = chapter_number
     ch = None
     for c in chapters:
-        if c.get("chapter_number") == chapter_number:
+        if _same_chapter_number(c.get("chapter_number"), n):
             ch = c
             break
+    n_idx = _norm_chapter_num(n) if n is not None else None
+    if not ch and chapters and n_idx is not None and 1 <= n_idx <= len(chapters):
+        ch = chapters[n_idx - 1]
     if not ch:
         raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found")
 
@@ -370,7 +418,8 @@ async def stream_chapter_audio(task_id: str, chapter_number: int):
             # Re-split to get this chapter's text
             from app.services.pdf_processor import split_into_chapters
             splits = split_into_chapters(full)
-            idx = chapter_number - 1
+            ni = _norm_chapter_num(chapter_number) or 1
+            idx = int(ni) - 1
             if 0 <= idx < len(splits):
                 text = splits[idx].get("text", "")
 
@@ -411,18 +460,28 @@ async def get_chapter_text(task_id: str, chapter_number: int):
         raise HTTPException(status_code=400, detail="Task not completed yet")
 
     result = task.get("result") or {}
+    n = _norm_chapter_num(chapter_number) if _norm_chapter_num(chapter_number) is not None else chapter_number
     title = f"Chapter {chapter_number}"
     for ch in result.get("chapters", []):
-        if ch.get("chapter_number") == chapter_number:
+        if _same_chapter_number(ch.get("chapter_number"), n):
             title = ch.get("title") or title
             break
 
     text = _find_chapter_text(task_id, chapter_number)
     if not text:
         for ch in result.get("chapters", []):
-            if ch.get("chapter_number") == chapter_number:
+            if _same_chapter_number(ch.get("chapter_number"), n):
                 text = ch.get("full_text", "")
                 break
+
+    if not text:
+        disk = _load_summary_file(task_id)
+        if disk:
+            for ch in (disk.get("chapters") or []):
+                if _same_chapter_number(ch.get("chapter_number"), n):
+                    text = (ch.get("full_text") or ch.get("text") or "")
+                    if text:
+                        break
 
     if not text:
         text_file = Path(settings.OUTPUT_DIR) / task_id / "extracted_text.txt"
@@ -430,7 +489,8 @@ async def get_chapter_text(task_id: str, chapter_number: int):
             full = text_file.read_text(encoding="utf-8")
             from app.services.pdf_processor import split_into_chapters
             splits = split_into_chapters(full)
-            idx = chapter_number - 1
+            ni = _norm_chapter_num(chapter_number) or 1
+            idx = int(ni) - 1
             if 0 <= idx < len(splits):
                 text = splits[idx].get("text", "")
 

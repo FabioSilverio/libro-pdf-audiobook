@@ -28,11 +28,22 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    const errorMessage = error.response?.data?.error || error.message || 'Unknown error occurred';
-    console.error('API Error:', errorMessage);
+    const data = error.response?.data;
+    let errMsg;
+    if (data && typeof data === 'object' && data.detail != null) {
+      const d = data.detail;
+      errMsg = typeof d === 'string' ? d : JSON.stringify(d);
+    } else if (data && typeof data === 'object' && data.error) {
+      errMsg = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+    } else if (typeof data === 'string' && data) {
+      errMsg = data;
+    } else {
+      errMsg = error.message || 'Unknown error occurred';
+    }
+    console.error('API Error:', errMsg);
     return Promise.reject({
-      message: errorMessage,
-      code: error.response?.data?.code,
+      message: errMsg,
+      code: data?.code,
       status: error.response?.status,
     });
   }
