@@ -23,6 +23,27 @@ logger = logging.getLogger(__name__)
 _MIN_CHAPTER_CHARS = 200
 
 
+def _spine_html_items(book: epub.EpubBook):
+    """Yield each spine item that is an HTML document, in *reading* order.
+
+    ``get_items_of_type(ITEM_DOCUMENT)`` follows manifest order, which is often
+    **not** the book's linear reading order (commonly close to filename sort).
+    The EPUB ``<spine>`` defines the real sequence; without it, chapters can
+    look shuffled and titles may repeat in illogical order.
+    """
+    for spine_entry in book.spine:
+        if not spine_entry:
+            continue
+        # ebooklib: spine is [(idref, linear), ...] — see EpubReader._load_spine
+        item_id = spine_entry[0] if isinstance(spine_entry, (list, tuple)) else spine_entry
+        item = book.get_item_with_id(item_id)
+        if item is None:
+            continue
+        if item.get_type() != ebooklib.ITEM_DOCUMENT:
+            continue
+        yield item
+
+
 # ---------------------------------------------------------------------------
 # Public API (mirrors pdf_processor)
 # ---------------------------------------------------------------------------
@@ -45,14 +66,14 @@ def extract_text(epub_path: str, *, on_progress=None, **_kw) -> str:
     except Exception as e:
         raise PDFProcessingError(f"Failed to read EPUB: {e}")
 
-    items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+    items = list(_spine_html_items(book))
     total = len(items)
     if total == 0:
         raise EmptyPDFError()
 
     if on_progress:
         try:
-            on_progress("extracting", 0, total, f"Reading EPUB ({total} sections)")
+            on_progress("extracting", 0, total, f"Reading EPUB ({total} spine sections)")
         except Exception:
             pass
 
@@ -105,7 +126,7 @@ def extract_metadata(epub_path: str) -> Dict[str, Any]:
         if creators:
             metadata["author"] = creators[0][0]
         # "page_count" → use number of spine items as a proxy
-        metadata["page_count"] = len(list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT)))
+        metadata["page_count"] = len(list(_spine_html_items(book)))
     except Exception as e:
         logger.warning(f"EPUB metadata extraction failed: {e}")
     return metadata
@@ -122,7 +143,8 @@ def split_into_chapters(epub_path: str, full_text: str) -> List[Dict[str, Any]]:
     try:
         book = epub.read_epub(epub_path, options={"ignore_ncx": True})
         toc_titles = _extract_toc_titles(book)
-        items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+        items = list(_spine_html_items(book))
+        logger.info("EPUB chapter split: %d spine item(s) in reading order", len(items))
 
         for idx, item in enumerate(items):
             try:
