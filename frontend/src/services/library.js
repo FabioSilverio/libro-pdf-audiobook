@@ -53,7 +53,9 @@ export function removeBook(taskId) {
   saveLibrary(getLibrary().filter((b) => b.task_id !== taskId));
   try {
     localStorage.removeItem(PROGRESS_KEY(taskId));
-  } catch {}
+  } catch {
+    // Ignore storage cleanup failures.
+  }
 }
 
 // ---------- Per-book progress ----------

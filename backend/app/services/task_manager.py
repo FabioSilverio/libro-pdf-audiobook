@@ -33,6 +33,25 @@ def _safe_filename(name: str, fallback: str) -> str:
     return clean[:60] or fallback
 
 
+def _chapter_text_manifest(chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Persist full chapter text separately from lightweight metadata."""
+    return {
+        "chapters": [
+            {
+                "chapter_number": i + 1,
+                "title": ch.get("title", f"Chapter {i + 1}"),
+                "text": ch.get("text") or ch.get("full_text") or "",
+            }
+            for i, ch in enumerate(chapters)
+        ]
+    }
+
+
+def _strip_chapter_text(chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return chapter metadata without heavyweight full_text payloads."""
+    return [{k: v for k, v in ch.items() if k != "full_text"} for ch in chapters]
+
+
 class TaskManager:
     # Keys persisted to disk (skip WebSocket handles, etc.).
     _PERSIST_KEYS = {
@@ -203,7 +222,8 @@ class TaskManager:
 
             # Free disk space — we no longer need the uploaded file.
             try:
-                Path(task["file_path"]).unlink(missing_ok=True)
+                if not is_epub:
+                    Path(task["file_path"]).unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -240,6 +260,17 @@ class TaskManager:
                 chapters = await asyncio.to_thread(pdf_processor.split_into_chapters, text)
             logger.info(f"Task {task_id}: {len(chapters)} chapters detected")
 
+            (output_dir / "chapter_texts.json").write_text(
+                json.dumps(_chapter_text_manifest(chapters), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            if is_epub:
+                try:
+                    Path(task["file_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
             # 3. Summarization --------------------------------------------------
             summary_data: Dict[str, Any] = {"metadata": metadata, "language": language}
             if opts.get("summarize", True):
@@ -263,7 +294,7 @@ class TaskManager:
                     length=opts.get("summary_length", "medium"),
                     language=language,
                 )
-                summary_data["chapters"] = chapter_summaries
+                summary_data["chapters"] = _strip_chapter_text(chapter_summaries)
             else:
                 summary_data["summary"] = ""
                 summary_data["key_points"] = []

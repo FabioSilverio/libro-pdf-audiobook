@@ -18,7 +18,9 @@ export default function App() {
       if (urlTask) return { view: 'processing', taskId: urlTask };
       const stored = localStorage.getItem(ACTIVE_TASK_KEY);
       if (stored) return { view: 'processing', taskId: stored };
-    } catch {}
+    } catch {
+      // Ignore malformed URL/localStorage data and use the default boot view.
+    }
     return {
       view: getLibrary().length > 0 ? 'library' : 'upload',
       taskId: null,
@@ -39,13 +41,10 @@ export default function App() {
       } else {
         localStorage.removeItem(ACTIVE_TASK_KEY);
       }
-    } catch {}
+    } catch {
+      // localStorage can be unavailable in private or restricted browser modes.
+    }
   }, [taskId, view]);
-
-  // Keep library count in sync
-  useEffect(() => {
-    setLibraryCount(getLibrary().length);
-  }, [view, audiobook]);
 
   const handleUploadSuccess = (result) => {
     setTaskId(result.task_id);
@@ -57,6 +56,7 @@ export default function App() {
     try {
       const data = await getAudiobookMetadata(taskId);
       upsertBook(data);
+      setLibraryCount(getLibrary().length);
       setAudiobook(data);
       setView('audiobook');
     } catch {
@@ -82,6 +82,7 @@ export default function App() {
     try {
       const fresh = await getAudiobookMetadata(id);
       upsertBook(fresh);
+      setLibraryCount(getLibrary().length);
       setAudiobook(fresh);
       setTaskId(id);
       if (!cached) setView('audiobook');
@@ -94,6 +95,7 @@ export default function App() {
     setAudiobook(null);
     setTaskId(null);
     setError(null);
+    setLibraryCount(getLibrary().length);
     setView('library');
   };
 

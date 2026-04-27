@@ -1,10 +1,11 @@
 /**
- * Custom hook for tracking task progress via WebSocket with polling fallback
+ * Custom hook for tracking task progress via WebSocket with polling fallback.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { getTaskStatus } from '../services/api';
 
 const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
+const FINISHED_STATUSES = ['completed', 'failed', 'cancelled'];
 
 export function useTaskProgress(taskId) {
   const [status, setStatus] = useState(null);
@@ -17,103 +18,42 @@ export function useTaskProgress(taskId) {
   const wsRef = useRef(null);
   const pollingIntervalRef = useRef(null);
   const retryTimeoutRef = useRef(null);
+  const statusRef = useRef(null);
 
-  // Connect to WebSocket
-  const connectWebSocket = useCallback(() => {
-    if (!taskId || wsRef.current) return;
+  const applyTaskStatus = useCallback((taskStatus) => {
+    statusRef.current = taskStatus.status;
+    setStatus(taskStatus.status);
+    setProgress(taskStatus.progress);
+    setStage(taskStatus.stage || '');
+    setMessage(taskStatus.message || '');
+  }, []);
 
-    try {
-      const ws = new WebSocket(`${WS_BASE_URL}/ws/${taskId}`);
-
-      ws.onopen = () => {
-        console.log('WebSocket connected');
-        setIsConnected(true);
-        setError(null);
-
-        // Send ping to keep connection alive
-        const pingInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send('ping');
-          } else {
-            clearInterval(pingInterval);
-          }
-        }, 30000);
-
-        ws.pingInterval = pingInterval;
-      };
-
-      ws.onmessage = (event) => {
-        // Server replies plain text "pong" to our "ping"; ignore non-JSON frames.
-        const raw = event.data;
-        if (typeof raw !== 'string' || !raw.startsWith('{')) return;
-        try {
-          const data = JSON.parse(raw);
-          if (data.type === 'progress' || data.type === 'status') {
-            const taskData = data.data;
-            setStatus(taskData.status);
-            setProgress(taskData.progress);
-            setStage(taskData.stage || '');
-            setMessage(taskData.message || '');
-          }
-        } catch (err) {
-          console.warn('Ignoring non-JSON WS message:', raw);
-        }
-      };
-
-      ws.onerror = (err) => {
-        console.error('WebSocket error:', err);
-        setIsConnected(false);
-      };
-
-      ws.onclose = () => {
-        console.log('WebSocket disconnected');
-        setIsConnected(false);
-        clearTimeout(wsRef.current?.pingInterval);
-        wsRef.current = null;
-
-        // Fallback to polling if not completed
-        if (status !== 'completed' && status !== 'failed' && status !== 'cancelled') {
-          console.log('Starting polling fallback');
-          startPolling();
-        }
-      };
-
-      wsRef.current = ws;
-    } catch (err) {
-      console.error('Failed to connect WebSocket:', err);
-      setError('Failed to connect to real-time updates');
-      startPolling();
+  const stopPolling = useCallback(() => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
     }
-  }, [taskId, status]);
+  }, []);
 
-  // Start polling fallback
   const startPolling = useCallback(() => {
-    if (pollingIntervalRef.current) return;
+    if (!taskId || pollingIntervalRef.current) return;
 
     const poll = async () => {
       try {
         const taskStatus = await getTaskStatus(taskId);
-        setStatus(taskStatus.status);
-        setProgress(taskStatus.progress);
-        setStage(taskStatus.stage || '');
-        setMessage(taskStatus.message || '');
+        applyTaskStatus(taskStatus);
 
-        // Stop polling when complete
-        if (['completed', 'failed', 'cancelled'].includes(taskStatus.status)) {
+        if (FINISHED_STATUSES.includes(taskStatus.status)) {
           stopPolling();
         }
       } catch (err) {
-        // 404 on polling almost always means the server forgot the task
-        // (most commonly a redeploy / container restart wiped in-memory
-        // state). Give up immediately with a clear message — otherwise
-        // the UI would hammer the endpoint forever.
-        const code = err?.response?.status;
+        const code = err?.response?.status || err?.status;
         if (code === 404) {
-          console.warn('Task not found on server (404). Likely server restart.');
+          statusRef.current = 'failed';
           setStatus('failed');
           setMessage(
             'The server lost track of this task (it probably restarted). ' +
-            'Please upload the PDF again to resume.'
+            'Please upload the file again to resume.'
           );
           setError('Task not found on server.');
           stopPolling();
@@ -124,44 +64,82 @@ export function useTaskProgress(taskId) {
       }
     };
 
-    // Poll immediately
     poll();
-
-    // Then every 2 seconds
     pollingIntervalRef.current = setInterval(poll, 2000);
-  }, [taskId]);
+  }, [applyTaskStatus, stopPolling, taskId]);
 
-  // Stop polling
-  const stopPolling = useCallback(() => {
-    if (pollingIntervalRef.current) {
-      clearInterval(pollingIntervalRef.current);
-      pollingIntervalRef.current = null;
-    }
-  }, []);
-
-  // Disconnect WebSocket
   const disconnectWebSocket = useCallback(() => {
     if (wsRef.current) {
-      clearTimeout(wsRef.current.pingInterval);
+      clearInterval(wsRef.current.pingInterval);
       wsRef.current.close();
       wsRef.current = null;
     }
   }, []);
 
-  // Initialize connection
-  useEffect(() => {
-    if (!taskId) return;
+  const connectWebSocket = useCallback(() => {
+    if (!taskId || wsRef.current) return;
 
-    // Fetch initial status
+    try {
+      const ws = new WebSocket(`${WS_BASE_URL}/ws/${taskId}`);
+
+      ws.onopen = () => {
+        setIsConnected(true);
+        setError(null);
+
+        ws.pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send('ping');
+          } else {
+            clearInterval(ws.pingInterval);
+          }
+        }, 30000);
+      };
+
+      ws.onmessage = (event) => {
+        const raw = event.data;
+        if (typeof raw !== 'string' || !raw.startsWith('{')) return;
+
+        try {
+          const data = JSON.parse(raw);
+          if (data.type === 'progress' || data.type === 'status') {
+            applyTaskStatus(data.data);
+          }
+        } catch {
+          console.warn('Ignoring non-JSON WS message:', raw);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error:', err);
+        setIsConnected(false);
+      };
+
+      ws.onclose = () => {
+        setIsConnected(false);
+        clearInterval(ws.pingInterval);
+        wsRef.current = null;
+
+        if (!FINISHED_STATUSES.includes(statusRef.current)) {
+          startPolling();
+        }
+      };
+
+      wsRef.current = ws;
+    } catch (err) {
+      console.error('Failed to connect WebSocket:', err);
+      setError('Failed to connect to real-time updates');
+      startPolling();
+    }
+  }, [applyTaskStatus, startPolling, taskId]);
+
+  useEffect(() => {
+    if (!taskId) return undefined;
+    const retryTimer = retryTimeoutRef.current;
+
     getTaskStatus(taskId)
       .then((taskStatus) => {
-        setStatus(taskStatus.status);
-        setProgress(taskStatus.progress);
-        setStage(taskStatus.stage || '');
-        setMessage(taskStatus.message || '');
-
-        // If already complete, don't connect
-        if (!['completed', 'failed', 'cancelled'].includes(taskStatus.status)) {
+        applyTaskStatus(taskStatus);
+        if (!FINISHED_STATUSES.includes(taskStatus.status)) {
           connectWebSocket();
         }
       })
@@ -170,17 +148,15 @@ export function useTaskProgress(taskId) {
         setError(err.message || 'Failed to fetch task status');
       });
 
-    // Cleanup on unmount
     return () => {
       disconnectWebSocket();
       stopPolling();
-      if (retryTimeoutRef.current) {
-        clearTimeout(retryTimeoutRef.current);
+      if (retryTimer) {
+        clearTimeout(retryTimer);
       }
     };
-  }, [taskId, connectWebSocket, disconnectWebSocket, stopPolling]);
+  }, [applyTaskStatus, connectWebSocket, disconnectWebSocket, stopPolling, taskId]);
 
-  // Cancel task
   const cancelTask = useCallback(async () => {
     try {
       const response = await fetch(`${WS_BASE_URL.replace('ws', 'http')}/api/v1/tasks/${taskId}`, {
@@ -188,6 +164,7 @@ export function useTaskProgress(taskId) {
       });
 
       if (response.ok) {
+        statusRef.current = 'cancelled';
         setStatus('cancelled');
         setMessage('Task cancelled by user');
         disconnectWebSocket();
@@ -197,7 +174,7 @@ export function useTaskProgress(taskId) {
       console.error('Failed to cancel task:', err);
       setError('Failed to cancel task');
     }
-  }, [taskId, disconnectWebSocket, stopPolling]);
+  }, [disconnectWebSocket, stopPolling, taskId]);
 
   return {
     status,

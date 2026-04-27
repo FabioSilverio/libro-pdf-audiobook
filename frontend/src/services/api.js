@@ -122,6 +122,11 @@ export const getExtractedText = async (taskId) => {
   return response.data;
 };
 
+export const getChapterText = async (taskId, chapterNumber) => {
+  const response = await api.get(`/api/v1/audiobooks/${taskId}/chapters/${chapterNumber}/text`);
+  return response.data;
+};
+
 /**
  * Get summary
  * @param {string} taskId - Task identifier

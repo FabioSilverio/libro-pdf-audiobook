@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
+import json
 import logging
 
 from app.config import settings
@@ -12,6 +13,34 @@ from app.models import TaskStatus
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/audiobooks", tags=["audiobooks"])
+
+
+def _chapter_text_path(task_id: str) -> Path:
+    return Path(settings.OUTPUT_DIR) / task_id / "chapter_texts.json"
+
+
+def _load_chapter_texts(task_id: str) -> list[dict]:
+    path = _chapter_text_path(task_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        chapters = data.get("chapters", [])
+        return chapters if isinstance(chapters, list) else []
+    except Exception as e:
+        logger.warning(f"Could not read chapter text manifest for {task_id}: {e}")
+        return []
+
+
+def _find_chapter_text(task_id: str, chapter_number: int) -> str:
+    for ch in _load_chapter_texts(task_id):
+        if ch.get("chapter_number") == chapter_number:
+            return ch.get("text", "")
+    return ""
+
+
+def _without_full_text(chapter: dict) -> dict:
+    return {k: v for k, v in chapter.items() if k != "full_text"}
 
 
 @router.get("/voices")
@@ -51,7 +80,7 @@ async def get_audiobook_metadata(task_id: str):
 
     # Build on-demand audio manifest from chapters (even if pre-gen audio
     # exists we also include the on-demand URLs as a fallback).
-    chapters = result.get("chapters", [])
+    chapters = [_without_full_text(ch) for ch in result.get("chapters", [])]
     audio = result.get("audio", [])
     if not audio and chapters:
         audio = [
@@ -142,12 +171,28 @@ async def resummarize_audiobook(task_id: str, length: str = "medium"):
     chapter_summaries = await generate_chapter_summaries(
         chapters, length=length, language=language,
     )
+    try:
+        _chapter_text_path(task_id).write_text(
+            json.dumps({
+                "chapters": [
+                    {
+                        "chapter_number": i + 1,
+                        "title": ch.get("title", f"Chapter {i + 1}"),
+                        "text": ch.get("text", ""),
+                    }
+                    for i, ch in enumerate(chapters)
+                ]
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"Could not persist chapter texts for {task_id}: {e}")
 
     # Merge back into the stored result, preserving audio + metadata.
     result = task.get("result") or {}
     result["summary"] = overall["summary"]
     result["key_points"] = overall.get("key_points", [])
-    result["chapters"] = chapter_summaries
+    result["chapters"] = [_without_full_text(ch) for ch in chapter_summaries]
     result["language"] = language
     task["result"] = result
     task_manager._persist_task(task_id)
@@ -161,7 +206,7 @@ async def resummarize_audiobook(task_id: str, length: str = "medium"):
         "language": language,
         "summary": result["summary"],
         "key_points": result["key_points"],
-        "chapters": result["chapters"],
+        "chapters": [_without_full_text(ch) for ch in result["chapters"]],
         "audio": result.get("audio", []),
         "created_at": task_status["created_at"],
     }
@@ -315,8 +360,9 @@ async def stream_chapter_audio(task_id: str, chapter_number: int):
             filename=filename, headers={"Accept-Ranges": "bytes"},
         )
 
-    # Need the chapter text from extracted_text or full_text in result
-    text = ch.get("full_text", "")
+    # Need the chapter text from the lightweight sidecar manifest. Older tasks
+    # may still have full_text in summary.json or only extracted_text.txt.
+    text = _find_chapter_text(task_id, chapter_number) or ch.get("full_text", "")
     if not text:
         text_file = Path(settings.OUTPUT_DIR) / task_id / "extracted_text.txt"
         if text_file.exists():
@@ -353,6 +399,51 @@ async def stream_chapter_audio(task_id: str, chapter_number: int):
         str(audio_path), media_type="audio/mpeg",
         filename=filename, headers={"Accept-Ranges": "bytes"},
     )
+
+
+@router.get("/{task_id}/chapters/{chapter_number}/text")
+async def get_chapter_text(task_id: str, chapter_number: int):
+    """Return one chapter's full text for the reader UI."""
+    task = task_manager.tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Task not completed yet")
+
+    result = task.get("result") or {}
+    title = f"Chapter {chapter_number}"
+    for ch in result.get("chapters", []):
+        if ch.get("chapter_number") == chapter_number:
+            title = ch.get("title") or title
+            break
+
+    text = _find_chapter_text(task_id, chapter_number)
+    if not text:
+        for ch in result.get("chapters", []):
+            if ch.get("chapter_number") == chapter_number:
+                text = ch.get("full_text", "")
+                break
+
+    if not text:
+        text_file = Path(settings.OUTPUT_DIR) / task_id / "extracted_text.txt"
+        if text_file.exists():
+            full = text_file.read_text(encoding="utf-8")
+            from app.services.pdf_processor import split_into_chapters
+            splits = split_into_chapters(full)
+            idx = chapter_number - 1
+            if 0 <= idx < len(splits):
+                text = splits[idx].get("text", "")
+
+    if not text:
+        raise HTTPException(status_code=404, detail="Chapter text not found")
+
+    return {
+        "task_id": task_id,
+        "chapter_number": chapter_number,
+        "title": title,
+        "text": text,
+        "length": len(text),
+    }
 
 
 @router.get("/{task_id}/audio/{filename}")

@@ -1,15 +1,14 @@
-import { useEffect, useState, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { getLibrary, getProgress, removeBook, upsertBook, computeBookProgress, exportLibrary, importLibrary } from '../services/library';
 import { resummarizeAudiobook } from '../services/api';
 
 export default function Library({ onOpen, onNew }) {
-  const [books, setBooks] = useState([]);
+  const [books, setBooks] = useState(() => getLibrary());
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState('');
   const importRef = useRef(null);
 
   const refresh = () => setBooks(getLibrary());
-  useEffect(() => { refresh(); }, []);
 
   const handleDelete = (e, taskId) => {
     e.stopPropagation();
@@ -124,7 +123,7 @@ export default function Library({ onOpen, onNew }) {
         {books.map((b) => {
           const prog = getProgress(b.task_id);
           const pct = Math.round(computeBookProgress(b, prog) * 100);
-          const when = new Date(b.saved_at || b.created_at || Date.now()).toLocaleDateString();
+          const when = new Date(b.saved_at || b.created_at || 0).toLocaleDateString();
           return (
             <article
               key={b.task_id}

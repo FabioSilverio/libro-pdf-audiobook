@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = "./outputs"
 
     # CORS Configuration
-    CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
 
     # Rate Limiting
     RATE_LIMIT_UPLOAD: int = 10
