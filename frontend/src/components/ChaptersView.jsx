@@ -46,6 +46,8 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
   const [textState, setTextState] = useState('idle');
   const [textError, setTextError] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
+  /** True from Play click until the browser has enough of the (server-generated) file to start playback. */
+  const [isAudioPreparing, setIsAudioPreparing] = useState(false);
   const [playback, setPlayback] = useState(() => {
     const saved = getProgress(task_id);
     const first = saved.audio?.[activeChapter] || {};
@@ -106,6 +108,7 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
   const selectChapter = (number) => {
     const nextSaved = progress.audio?.[number] || {};
     setIsPlaying(false);
+    setIsAudioPreparing(false);
     setPlayback({ time: nextSaved.time || 0, duration: nextSaved.duration || 0 });
     setTextState('loading');
     setTextError('');
@@ -133,15 +136,25 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
     const el = audioRef.current;
     if (!el || !audioUrl) return;
 
+    // Cancel while the server is still generating / the stream is opening.
+    if (isAudioPreparing) {
+      el.pause();
+      setIsAudioPreparing(false);
+      setIsPlaying(false);
+      return;
+    }
+
     if (el.paused) {
+      setIsAudioPreparing(true);
       try {
         await el.play();
-        setIsPlaying(true);
       } catch {
+        setIsAudioPreparing(false);
         setIsPlaying(false);
       }
     } else {
       el.pause();
+      setIsAudioPreparing(false);
       setIsPlaying(false);
     }
   };
@@ -158,6 +171,7 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
   const handleTimeUpdate = (e) => {
     const el = e.currentTarget;
     const now = el.currentTime;
+    if (now > 0.15) setIsAudioPreparing(false);
     setPlayback({ time: now, duration: el.duration || 0 });
     if (Math.abs(now - lastSavedTimeRef.current) >= 3) {
       lastSavedTimeRef.current = now;
@@ -167,6 +181,7 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
 
   const handleEnded = (e) => {
     setIsPlaying(false);
+    setIsAudioPreparing(false);
     saveAudioProgress({
       time: e.currentTarget.duration || 0,
       duration: e.currentTarget.duration || 0,
@@ -184,9 +199,14 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
       setPlayback({ time: nextSaved.time || 0, duration: nextSaved.duration || 0 });
       setActiveChapter(nextNumber);
       window.setTimeout(() => {
-        audioRef.current?.play()
-          .then(() => setIsPlaying(true))
-          .catch(() => setIsPlaying(false));
+        const a = audioRef.current;
+        if (!a) return;
+        setIsAudioPreparing(true);
+        a.play()
+          .catch(() => {
+            setIsAudioPreparing(false);
+            setIsPlaying(false);
+          });
       }, 350);
     }
   };
@@ -230,15 +250,37 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
           <span className="chapter-number">CH {String(activeNumber).padStart(2, '0')}</span>
           <div>
             <h2>{active?.title || `Chapter ${activeNumber}`}</h2>
-            <p>{savedAudio.done ? 'Finished' : chapterPct ? `${chapterPct}% listened` : 'Ready to listen'}</p>
+            <p>
+              {savedAudio.done
+                ? 'Finished'
+                : isAudioPreparing
+                  ? 'Generating audio (first time can be slow) — hang tight…'
+                  : chapterPct
+                    ? `${chapterPct}% listened`
+                    : isPlaying
+                      ? 'Playing'
+                      : 'Ready to listen'}
+            </p>
           </div>
         </div>
         {audioUrl ? (
-          <div className="custom-player">
-            <button className="player-toggle" type="button" onClick={togglePlayback}>
-              {isPlaying ? 'Pause' : 'Play'}
+          <div className={`custom-player ${isAudioPreparing ? 'is-preparing' : ''}`}>
+            <button
+              className="player-toggle"
+              type="button"
+              onClick={togglePlayback}
+              aria-busy={isAudioPreparing}
+              title={
+                isAudioPreparing
+                  ? 'Click to stop waiting'
+                  : undefined
+              }
+            >
+              {isAudioPreparing ? 'Preparing…' : isPlaying ? 'Pause' : 'Play'}
             </button>
-            <span className="player-time">{formatTime(currentTime)}</span>
+            <span className="player-time">
+              {isAudioPreparing ? '—' : formatTime(currentTime)}
+            </span>
             <input
               className="player-seek"
               type="range"
@@ -247,20 +289,39 @@ export default function ChaptersView({ audiobook, onStartOver, onBackToLibrary }
               step="0.1"
               value={Math.min(currentTime, Math.max(duration, 1))}
               onChange={handleSeek}
+              disabled={isAudioPreparing}
               aria-label="Seek audio"
             />
-            <span className="player-time">{formatTime(duration)}</span>
+            <span className="player-time">
+              {isAudioPreparing || !Number.isFinite(duration) || duration <= 0 ? '—' : formatTime(duration)}
+            </span>
             <audio
               ref={audioRef}
               preload="none"
               src={audioUrl}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
+              onPlaying={() => {
+                setIsAudioPreparing(false);
+                setIsPlaying(true);
+              }}
+              onPause={() => {
+                setIsPlaying(false);
+                if (!audioRef.current || !Number.isFinite(audioRef.current.currentTime) || audioRef.current.currentTime < 0.01) {
+                  setIsAudioPreparing(false);
+                }
+              }}
               onTimeUpdate={handleTimeUpdate}
               onLoadedMetadata={(e) => {
                 const nextDuration = e.currentTarget.duration || 0;
+                if (Number.isFinite(nextDuration) && nextDuration > 0) {
+                  setIsAudioPreparing(false);
+                }
                 setPlayback((current) => ({ ...current, duration: nextDuration }));
                 saveAudioProgress({ duration: nextDuration });
+              }}
+              onCanPlay={() => setIsAudioPreparing(false)}
+              onError={() => {
+                setIsAudioPreparing(false);
+                setIsPlaying(false);
               }}
               onEnded={handleEnded}
             />

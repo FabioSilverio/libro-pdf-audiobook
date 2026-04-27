@@ -697,6 +697,27 @@
   accent-color: var(--accent);
 }
 
+.custom-player.is-preparing .player-seek {
+  opacity: 0.5;
+  pointer-events: none;
+  animation: player-seek-prep 1.1s ease-in-out infinite;
+}
+
+.custom-player.is-preparing .player-toggle {
+  background: color-mix(in srgb, var(--accent) 70%, var(--text-muted) 30%);
+  cursor: wait;
+}
+
+@keyframes player-seek-prep {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
 .now-playing {
   display: flex;
   align-items: center;
